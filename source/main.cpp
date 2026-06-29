@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "apk.h"
+#include "compat/loader.h"
 
 static const char* APK_DIR  = "sdmc:/BareDroidNX/apks";
 static const char* LOG_FILE = "sdmc:/BareDroidNX/log.txt";
@@ -376,7 +377,13 @@ int main(int, char**) {
                         break;
                     case BTN_A:
                         if (!app.apks.empty()) {
-                            app.showLaunchStub(app.selected);
+                            const ApkInfo& apk = app.apks[app.selected];
+                            bool ok = launchApk(apk.path, apk.packageName.empty()
+                                                 ? apk.filename : apk.packageName);
+                            if (!ok) {
+                                // Loader returned — show stub screen with status
+                                app.showLaunchStub(app.selected);
+                            }
                             redraw = true;
                         }
                         break;

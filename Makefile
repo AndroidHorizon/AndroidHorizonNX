@@ -12,7 +12,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	BareDroidNX
 BUILD		:=	build
-SOURCES		:=	source
+SOURCES		:=	source source/compat
 DATA		:=	data
 INCLUDES	:=	include
 ROMFS		:=	romfs
