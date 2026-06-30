@@ -15,22 +15,92 @@ extern void compatLogFmt(const char* fmt, ...);
 extern void compatUiLog(const char* msg);
 extern void compatUiSetPct(int pct);
 
+// ─── JIT write-fault emulation ────────────────────────────────────────────────
+// rx_addr (RX) and rw_addr (RW) are dual views of the same physical pages from
+// jitCreate(JitType_CodeMemory).  Writes to rx_addr raise a permission fault
+// (ESR EC=0x24, WnR=1, DFSC=0x0f).  We intercept them in the exception handler,
+// decode the ARM64 store instruction, replay the write through rw_addr, advance
+// PC past the faulting instruction, and resume — so ctors and JNI_OnLoad can
+// initialize globals without repeatedly crashing.
+struct JitEmuRegion {
+    uint64_t rx_alloc;
+    uint64_t rw_alloc;
+    size_t   size;
+};
+static JitEmuRegion g_jit_emu_regions[4];
+static int          g_jit_emu_count = 0;
+
+static bool emulateStore(ThreadExceptionDump* ctx) {
+    uint64_t far = ctx->far.x;
+    for (int i = 0; i < g_jit_emu_count; i++) {
+        const JitEmuRegion& r = g_jit_emu_regions[i];
+        if (far < r.rx_alloc || far >= r.rx_alloc + r.size) continue;
+
+        uint32_t insn   = *(const uint32_t*)ctx->pc.x;  // rx_addr is readable
+        uint64_t rw_dst = r.rw_alloc + (far - r.rx_alloc);
+
+        auto getReg = [&](unsigned rt) -> uint64_t {
+            if (rt < 29) return ctx->cpu_gprs[rt].x;
+            if (rt == 29) return ctx->fp.x;
+            if (rt == 30) return ctx->lr.x;
+            return 0;  // x31 / xzr
+        };
+
+        // SIMD/FP stores have bit[26]=1 — uncommon for global-init, skip.
+        if ((insn >> 26) & 1) return false;
+
+        unsigned rt = insn & 0x1f;
+
+        // STP / STNP (store pair, non-SIMD): bits[29:27] = 101
+        if (((insn >> 27) & 7) == 5) {
+            unsigned rt2 = (insn >> 10) & 0x1f;
+            if ((insn >> 31) & 1) {
+                // 64-bit X pair (bit31=1)
+                *((uint64_t*) rw_dst)      = getReg(rt);
+                *((uint64_t*)(rw_dst + 8)) = getReg(rt2);
+            } else {
+                // 32-bit W pair (bit31=0)
+                *((uint32_t*) rw_dst)      = (uint32_t)getReg(rt);
+                *((uint32_t*)(rw_dst + 4)) = (uint32_t)getReg(rt2);
+            }
+        } else {
+            // STR / STUR / STLR and variants
+            uint64_t val = getReg(rt);
+            switch ((insn >> 30) & 3) {
+                case 3: *((uint64_t*)rw_dst) = val;           break;
+                case 2: *((uint32_t*)rw_dst) = (uint32_t)val; break;
+                case 1: *((uint16_t*)rw_dst) = (uint16_t)val; break;
+                case 0: *((uint8_t*) rw_dst) = (uint8_t)val;  break;
+            }
+        }
+
+        ctx->pc.x += 4;
+        return true;
+    }
+    return false;
+}
+
 // ─── Shared crash recovery ────────────────────────────────────────────────────
-// Non-static so loader.cpp and shim_table.cpp can also set up recovery scopes.
-// Override libnx's weak __libnx_exception_handler so hardware faults (data
-// aborts, instruction aborts) longjmp back to the nearest active recovery point.
-jmp_buf          g_recover_jmp;
-volatile bool    g_in_recover  = false;
-volatile int     g_recover_sig = 0;
-volatile uint32_t g_recover_esr = 0;  // ESR captured on each fault
+jmp_buf           g_recover_jmp;
+volatile bool     g_in_recover  = false;
+volatile int      g_recover_sig = 0;
+volatile uint32_t g_recover_esr = 0;
 
 extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    uint32_t esr = ctx->esr;
+    // Write-permission fault (EC=0x24, WnR=1) to a JIT rx region?
+    // Emulate the store via rw_addr and resume — no longjmp needed.
+    if (((esr >> 26) & 0x3f) == 0x24 && ((esr >> 6) & 1) && g_jit_emu_count > 0) {
+        if (emulateStore(ctx)) {
+            svcReturnFromException(0);
+            return;
+        }
+    }
     if (g_in_recover) {
         g_recover_sig = (int)ctx->error_desc;
-        g_recover_esr = ctx->esr;
+        g_recover_esr = esr;
         longjmp(g_recover_jmp, 1);
     }
-    // Not inside a recovery scope — re-raise as fatal.
     extern ThreadExceptionDump __nx_exceptiondump;
     __nx_exceptiondump = *ctx;
     svcReturnFromException(0xf801);
@@ -80,7 +150,6 @@ void elfRunCtors(LoadedSo* so, ProgressCb cb) {
     signal(SIGILL,  ctor_crash_handler);
 
     int  failed = 0, skipped = 0, ok = 0;
-    int  consec_wpf = 0;  // consecutive write-permission faults
 
     // DT_INIT runs before DT_INIT_ARRAY (same as Android linker order)
     if (so->init_fn) {
@@ -119,27 +188,11 @@ void elfRunCtors(LoadedSo* so, ProgressCb cb) {
             g_in_recover = false;
             compatLogFmt("ELF: ctor[%zu/%zu] OK", k + 1, n);
             ok++;
-            consec_wpf = 0;
         } else {
             g_in_recover = false;
-            uint32_t esr = g_recover_esr;
             compatLogFmt("ELF: ctor[%zu/%zu] FAULT sig=%d esr=0x%08x — skipped",
-                         k + 1, n, g_recover_sig, esr);
+                         k + 1, n, g_recover_sig, g_recover_esr);
             failed++;
-            // EC=0x24 (data abort) + WnR=1 (write) = write to read-execute page.
-            // On JitType_CodeMemory the rx_addr data pages are permanently RX and
-            // cannot be made writable.  If 3 consecutive ctors hit this, all the
-            // rest will too — bail early to avoid flooding the exception handler
-            // (417 hardware exceptions crash Atmosphere).
-            bool is_write_perm = ((esr >> 26) & 0x3f) == 0x24 && ((esr >> 6) & 1);
-            if (is_write_perm && ++consec_wpf >= 3) {
-                compatLogFmt("ELF: %s: write-perm fault x3 (JIT CodeMemory rx data not writable)"
-                             " — bailing, skipping %zu remaining ctors",
-                             soname, n - k - 1);
-                compatUiLog("ctors: early exit (JIT write-perm)");
-                break;
-            }
-            if (!is_write_perm) consec_wpf = 0;
         }
 
         if ((k + 1) % ui_interval == 0 || k + 1 == n) {
@@ -552,6 +605,19 @@ LoadedSo* elfLoad(const char* path) {
             compatLogFmt("JIT: jitTransitionToExecutable failed: 0x%08X", exec_rc);
         } else {
             compatLog("JIT: code memory is now executable");
+            // Register this region for write-fault emulation.
+            // The exception handler will silently redirect writes from rx_addr
+            // to rw_addr so ctors/JNI_OnLoad can initialize globals.
+            if (g_jit_emu_count < 4) {
+                g_jit_emu_regions[g_jit_emu_count++] = {
+                    (uint64_t)exec_alloc,
+                    (uint64_t)write_alloc,
+                    alloc_size
+                };
+                compatLogFmt("JIT: emu[%d] rx=%p rw=%p size=0x%zx",
+                             g_jit_emu_count - 1,
+                             (void*)exec_alloc, (void*)write_alloc, alloc_size);
+            }
         }
     } else {
         this_svc_perm_code = 0xD801;  // heap fallback — not executable

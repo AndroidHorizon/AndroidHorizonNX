@@ -1,3 +1,3 @@
 #pragma once
-#define BUILD_NUMBER 3
-#define BUILD_VERSION "testing-alpha-3"
+#define BUILD_NUMBER 4
+#define BUILD_VERSION "testing-alpha-4"
