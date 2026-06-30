@@ -5,6 +5,20 @@
 #include <cstdlib>
 #include <malloc.h>
 #include <vector>
+#include <setjmp.h>
+#include <signal.h>
+
+// ─── Constructor crash recovery ───────────────────────────────────────────────
+static jmp_buf        s_ctor_jmp;
+static volatile bool  s_in_ctor = false;
+static volatile int   s_ctor_sig = 0;
+
+static void ctor_crash_handler(int sig) {
+    if (s_in_ctor) {
+        s_ctor_sig = sig;
+        longjmp(s_ctor_jmp, 1);
+    }
+}
 
 // Log helpers (shared across compat/ via extern)
 extern void compatLog(const char* msg);
@@ -44,20 +58,40 @@ void elfRunCtors(LoadedSo* so) {
         return;
     }
 
+    // Install crash-recovery handler so a faulting constructor doesn't kill the
+    // whole process.  If libnx delivers SIGSEGV/SIGBUS, we longjmp back and
+    // mark that ctor as failed.  If the kernel kills us directly (no signal),
+    // the log still shows which ctor number we were attempting.
+    signal(SIGSEGV, ctor_crash_handler);
+    signal(SIGBUS,  ctor_crash_handler);
+    signal(SIGILL,  ctor_crash_handler);
+
+    int  failed = 0, skipped = 0, ok = 0;
     compatLogFmt("ELF: %s: running %zu constructors", soname, so->init_arr_count);
     for (size_t k = 0; k < so->init_arr_count; k++) {
         LoadedSo::InitFn fn = so->init_arr[k];
-        if (fn && fn != (LoadedSo::InitFn)(uintptr_t)-1) {
-            // Dump first 4 instructions to verify JIT copy and identify crash type
-            const uint32_t* code = (const uint32_t*)(const void*)fn;
-            compatLogFmt("ELF: ctor[%zu/%zu] @%p [%08x %08x %08x %08x]",
-                         k + 1, so->init_arr_count, (void*)fn,
-                         code[0], code[1], code[2], code[3]);
+        if (!fn || fn == (LoadedSo::InitFn)(uintptr_t)-1) { skipped++; continue; }
+
+        compatLogFmt("ELF: ctor[%zu/%zu] @%p", k + 1, so->init_arr_count, (void*)fn);
+        s_in_ctor = true;
+        s_ctor_sig = 0;
+        if (setjmp(s_ctor_jmp) == 0) {
             fn();
+            s_in_ctor = false;
             compatLogFmt("ELF: ctor[%zu/%zu] OK", k + 1, so->init_arr_count);
+            ok++;
+        } else {
+            s_in_ctor = false;
+            compatLogFmt("ELF: ctor[%zu/%zu] FAULT sig=%d — skipped",
+                         k + 1, so->init_arr_count, s_ctor_sig);
+            failed++;
         }
     }
-    compatLogFmt("ELF: %s: all constructors done", soname);
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS,  SIG_DFL);
+    signal(SIGILL,  SIG_DFL);
+    compatLogFmt("ELF: %s: ctors done ok=%d failed=%d skipped=%d",
+                 soname, ok, failed, skipped);
 }
 
 // All successfully loaded .so files (for cross-library symbol resolution)
