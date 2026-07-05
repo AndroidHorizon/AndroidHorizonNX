@@ -2,6 +2,8 @@
 #include "compat/android.h"
 #include <switch.h>
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_image.h>
+#include <GLES2/gl2.h>
 #include <minizip/unzip.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -694,6 +696,35 @@ void runGameOnMainThread(void* game_so_ptr,
         compatLogFlush();
     }
 
+    // Save the current GL back buffer as a PNG on the SD card — README material
+    // and proof of what the game actually rendered at that point.
+    auto saveGameScreenshot = [](int frame) {
+        mkdir("sdmc:/AndroidHorizonNX/screenshots", 0777);
+        char path[96];
+        snprintf(path, sizeof(path),
+                 "sdmc:/AndroidHorizonNX/screenshots/game_frame%d.png", frame);
+        const int W = 1280, H = 720;
+        uint8_t* px = (uint8_t*)malloc((size_t)W * H * 4);
+        if (!px) return;
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        uint8_t* row = (uint8_t*)malloc((size_t)W * 4);
+        if (row) {  // GL origin is bottom-left — flip rows for the PNG
+            for (int y = 0; y < H / 2; y++) {
+                memcpy(row, px + (size_t)y * W * 4, (size_t)W * 4);
+                memcpy(px + (size_t)y * W * 4, px + (size_t)(H - 1 - y) * W * 4, (size_t)W * 4);
+                memcpy(px + (size_t)(H - 1 - y) * W * 4, row, (size_t)W * 4);
+            }
+            free(row);
+        }
+        SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(
+            px, W, H, 32, W * 4, SDL_PIXELFORMAT_ABGR8888);
+        if (s) {
+            if (IMG_SavePNG(s, path) == 0) compatLogFmt("screenshot: %s", path);
+            SDL_FreeSurface(s);
+        }
+        free(px);
+    };
+
     typedef void (*NativeRender_fn)(JNIEnv*, jobject);
     NativeRender_fn nativeRender = (NativeRender_fn)so->findSym(
         "Java_org_cocos2dx_lib_Cocos2dxRenderer_nativeRender");
@@ -718,6 +749,10 @@ void runGameOnMainThread(void* game_so_ptr,
                 }
 
                 nativeRender(env, obj);
+
+                // Milestone captures: early splash, post-splash, in-menu
+                if (frame == 30 || frame == 300 || frame == 900)
+                    saveGameScreenshot(frame);
 
                 // Swap buffers (Cocos2d-x doesn't call eglSwapBuffers itself)
                 if (g_egl_display != EGL_NO_DISPLAY && g_egl_surface != EGL_NO_SURFACE)

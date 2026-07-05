@@ -228,6 +228,10 @@ loader.o: /home/aaron/Documents/Github/BareDroidNX/source/loader.cpp \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_version.h \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_locale.h \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_misc.h \
+ /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_image.h \
+ /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL.h \
+ /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/GLES2/gl2.h \
+ /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/GLES2/gl2platform.h \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/minizip/unzip.h \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/zlib.h \
  /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/zconf.h \
@@ -461,6 +465,10 @@ loader.o: /home/aaron/Documents/Github/BareDroidNX/source/loader.cpp \
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_version.h:
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_locale.h:
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_misc.h:
+/home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL_image.h:
+/home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/SDL2/SDL.h:
+/home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/GLES2/gl2.h:
+/home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/GLES2/gl2platform.h:
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/minizip/unzip.h:
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/zlib.h:
 /home/aaron/.local/share/containers/storage/overlay/5092c05c9c72443b0c1023904ca3095dd98da391290c48e57581e011fb44576a/diff/opt/devkitpro/portlibs/switch/include/zconf.h:

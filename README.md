@@ -48,15 +48,33 @@ Our test target is **Hill Climb Racing 1.x** by Fingersoft — a simple 2D physi
 
 ### What We've Achieved So Far
 
-- The NRO launches from hbmenu and shows a working APK browser UI
-- The Switch correctly **extracts the APK** — unpacking the game's native libraries and assets from the `.apk` file onto the SD card. This works reliably.
-- The Switch loads and parses all three ELF binaries (`libapplovin-native-crash-reporter.so`, `libquack.so`, `libgame.so`) and links them against our shim table
-- **All 403 JMPREL entries resolve successfully** — confirmed in the latest test log
-- The on-screen progress display shows a **live feed of `compat_log.txt`** in real time, with an animated scan bar so the screen never looks frozen even during long silent phases (e.g. running 417 native constructors)
-- **Docked mode is detected** — the footer warns you when launched in docked mode, since games require touch screen input (handheld only)
-- Full diagnostic output is written to `sdmc:/AndroidHorizonNX/compat_log.txt`
+**Hill Climb Racing boots and renders on real hardware.** The Fingersoft logo animates, the loading screen runs to completion, the game enters its main menu logic and starts preloading menu music and sound effects. That's real Android NDK game code rendering through switch-mesa on Horizon OS.
 
-The current frontier is **native constructors**: after JMPREL completes, 417 C++ constructors in `libgame.so` need to run before the game can start. We are working to determine if they succeed or where they stall.
+The full pipeline that works today:
+
+- The NRO launches from hbmenu (or an application-mode forwarder) with a themed APK browser UI
+- APK extraction — native libraries and assets unpacked from the `.apk` onto the SD card
+- All three ELF binaries (`libapplovin-native-crash-reporter.so`, `libquack.so`, `libgame.so`) load, relocate, and link against the shim table with **zero unresolved symbols**
+- All **417 native C++ constructors** run clean (the fix: JIT data pages needed to be flipped back to RW after the executable transition)
+- `JNI_OnLoad` runs, `Java_` entry points are discovered, `nativeInit` completes, and the render loop drives `nativeRender` at roughly **18 fps** in the menu
+- The fake JNI layer answers hundreds of thousands of calls (UserDefaults, market queries, AES encrypt/decrypt passthrough, audio engine hooks)
+- Live on-screen log feed during loading, full diagnostics in `sdmc:/AndroidHorizonNX/compat_log.txt`, and **automatic screenshots** of key moments saved to `sdmc:/AndroidHorizonNX/screenshots/`
+- Crash forensics: symbolized abort/exit backtraces, unrecovered-fault PC capture, and the game's own debug output routed into the log
+
+The current frontier: at ~165s the game deliberately calls `abort()` from inside its statically-linked libc++ right after its daily-missions bookkeeping — the classic `-fno-exceptions` "`__throw_system_error` becomes abort" pattern. The instrumented build captures a full backtrace to pin down the exact call site. Audio is silent (the Java-side SimpleAudioEngine is stubbed) and touch input is not delivered yet.
+
+---
+
+## Screenshots
+
+Android Horizon captures these **automatically on real hardware** — the launcher saves PNGs of each screen to `sdmc:/AndroidHorizonNX/screenshots/`, and the game loop snapshots the GL framebuffer at milestone frames (30 / 300 / 900) to prove what actually rendered. Copy them from the SD card into `docs/screenshots/` to update this section.
+
+| | |
+|---|---|
+| ![APK browser](docs/screenshots/ui_menu.png) | ![Loading screen](docs/screenshots/ui_loading.png) |
+| *APK browser — starfield, planet horizon, HOS button glyphs* | *Live loading screen with real-time compat log* |
+| ![Game rendering](docs/screenshots/game_frame300.png) | ![Result screen](docs/screenshots/ui_result.png) |
+| *Hill Climb Racing rendering on Horizon OS (frame 300)* | *Launch result diagnostics* |
 
 ---
 
@@ -125,17 +143,25 @@ All 403 JMPREL entries in the crash reporter library resolve successfully. The t
 
 After JMPREL, the ELF loader was crashing on `memcpy(code_heap_buf, ...)` because `svcCreateCodeMemory` was called too early, making the backing buffer inaccessible before we wrote to it. Fixed: `svcCreateCodeMemory` + `svcControlCodeMemory` are now deferred until after the memcpy.
 
-### 4. Native constructors — **ACTIVE INVESTIGATION**
+### 4. ~~Native constructors~~ — **RESOLVED (all 417 run clean)**
 
-After ELF loading, 417 C++ constructors in `libgame.so` need to run. The launcher logs each constructor address immediately before calling it and force-flushes to disk — look for the last `ELF: ctor[k/417] @0x...` line in `compat_log.txt` with no `OK` or `FAULT` after it to find which one stalls. We need a clean run showing `ELF: ctors done` to know where we stand.
+Root cause: `jitTransitionToExecutable` made the entire JIT region RX, including the data segment, so the very first constructor writing a C++ global hit a permission fault. Fix: data-segment pages are flipped back to RW after the executable transition, matching the Android linker's layout. `ctors done ok=417 failed=0`.
 
-### 5. Background threads not supported
+### 5. Game calls `abort()` after ~165s — **ACTIVE INVESTIGATION**
 
-`pthread_create` is stubbed to return a fake handle and never actually spawn a thread. Games that rely on a separate render or physics thread will appear frozen or crash.
+The game boots, renders its splash + loading screen, enters menu logic — then deliberately aborts right after its daily-missions bookkeeping. The symbolized caller sits in libc++'s `system_error` machinery, i.e. a `-fno-exceptions` build turning `__throw_system_error` into `abort()`. The current build logs a full symbolized backtrace at abort, captures the game's stderr, and implements `getrandom` (a prime suspect — `std::random_device` has no entropy source on Switch by default).
 
-### 6. Game may crash at runtime
+### 6. No audio yet
 
-Even with all symbols resolved and code executable, the game could crash during initialisation (NULL deref, bad GLES call, unimplemented JNI method, etc.). The next step is to get a crash address from the compat log and identify which code path is failing.
+Cocos2d-x SimpleAudioEngine routes all sound through JNI to Java-side `Cocos2dxSound`/`Cocos2dxMusic`, which are no-op stubs. The calls are logged (you can see every `preloadEffect`/`playBackgroundMusic` in the compat log) — actually playing the assets via SDL/audren is a planned phase.
+
+### 7. Background threads run synchronously
+
+`pthread_create` executes the thread function inline on the calling thread. This unblocks init-wait patterns, but long-running worker loops would stall the game. Real threads via libnx are a planned phase.
+
+### 8. Touch input not delivered
+
+The game renders but can't be played yet — touchscreen events aren't delivered through `AInputQueue` yet. Next major feature after the abort is fixed.
 
 ---
 
@@ -143,13 +169,11 @@ Even with all symbols resolved and code executable, the game could crash during 
 
 We're testing the `.apk` release of **Hill Climb Racing 1.67.0** specifically — the current Play Store release ships as a `.xapk`. Android Horizon's APK parser only understands plain `.apk` files right now, so `.xapk` support is out of scope until a later phase.
 
-There's no measured frame rate yet — the game hasn't booted far enough to render a single frame. Here's the theoretical ceiling based on the hardware alone:
+First real measured numbers from hardware:
 
-- Hill Climb Racing is a simple 2D physics game, originally tuned for 60 FPS on 2012-era phones with GPUs far weaker than the Switch's Tegra X1.
-- **Theoretical ceiling: a locked 60 FPS** — assuming it boots and renders at all.
-- The real risk to frame rate is the compat layer: `pthread_create` is stubbed (no real background thread), so any physics/render thread split will serialize onto one thread; GLES calls are translated through switch-mesa rather than a native Android GPU driver.
-
-This section gets replaced with real measured numbers once the game boots far enough to render a frame.
+- **~18 fps** in the menu/loading phase (300 frames in ~17 s), unoptimized — everything runs on one thread and GLES goes through switch-mesa rather than a native Android GPU driver
+- **~143 s** for the game's `nativeInit` (its loading screen) — dominated by first-time asset loading and tens of thousands of logged JNI UserDefault calls; log throttling and asset caching should cut this substantially
+- Theoretical ceiling remains a locked 60 FPS — Hill Climb Racing was tuned for 2012-era phones far weaker than the Tegra X1. Performance work starts after the game is stable and playable.
 
 ---
 
@@ -176,8 +200,13 @@ This section gets replaced with real measured numbers once the game boots far en
 - [x] **Live progress screen** — loader runs on a background thread; main thread renders at ~60fps with animated scan bar and live `compat_log.txt` tail (13 lines, colour-coded)
 - [x] **Elapsed time per stage** — stage label shows "(Xs)" so you can tell how long each step is taking
 - [x] **All 403 JMPREL entries resolved** — confirmed in hardware test
-- [ ] Identify whether constructors complete or stall — need a clean run showing `ELF: ctors done`
+- [x] **All 417 constructors run clean** — JIT data pages flipped back to RW after executable transition
+- [x] **Game boots and renders** — splash animation, full loading screen, menu logic, ~18 fps
+- [x] **Crash forensics** — symbolized abort/exit backtraces, unrecovered-fault PC capture, game stderr + debug strings routed to compat log
+- [x] **Automatic screenshots** — launcher screens + GL framebuffer at milestone frames saved to `sdmc:/AndroidHorizonNX/screenshots/`
+- [ ] Fix the ~165s `abort()` (libc++ `__throw_system_error` path — backtrace instrumentation in place)
 - [ ] Real touch input delivery via `AInputQueue` / `ALooper`
+- [ ] Audio playback (SimpleAudioEngine JNI calls → SDL/audren)
 
 ### Phase 1 — Touch input
 
@@ -194,10 +223,11 @@ This section gets replaced with real measured numbers once the game boots far en
 ### Phase 3 — Polish
 
 - [x] NRO icon (Android Horizon themed — green planet with curved text)
+- [x] **Icon-themed UI** — animated starfield, planet-horizon scenery, borealis-style glowing focus card, HOS button glyphs from the system font
 - [x] Dynamic GitHub avatar on About screen
 - [x] About screen (press **−**)
 - [x] Reinstall button (**X** in APK list)
-- [ ] Version bump system — each build increments `APP_VERSION`
+- [x] Version bump system — NACP + in-app version both track the build number (`0.1.<build>`)
 - [ ] Per-APK settings overlay (resolution, framerate cap)
 - [ ] APK delete / manage from the UI
 
@@ -213,7 +243,23 @@ This section gets replaced with real measured numbers once the game boots far en
 
 > Most recent first.
 
-### [Current Build]
+### 0.1.55 — Abort root-caused: `/dev/urandom`
+
+- [x] **The ~170s abort is fully root-caused** — build 54's symbolized backtrace shows `std::random_device` ctor → `__throw_system_error` → `abort()`. The ctor opens `/dev/urandom` through bionic's *fortified* `__open_2` (which our logging never saw), the path doesn't exist on Horizon OS, and the `-fno-exceptions` build turns the throw into an abort.
+- [x] **Fix: `/dev/urandom` virtual fd** — `open`/`__open_2` on `/dev/urandom` (or `/dev/random`) now return a magic fd backed by the Switch's hardware CSRNG; `read`/`__read_chk`/`close` handle it transparently.
+- [x] Screenshots confirmed working on hardware — launcher UI, live loading screen, Fingersoft splash (frame 30), and the HCR loading bar (frame 300) all captured automatically.
+
+### 0.1.53+ — The game renders!
+
+- [x] **Hill Climb Racing boots on hardware** — Fingersoft splash animates, loading screen completes, menu logic runs at ~18 fps. Root cause of the constructor crashes: the JIT transition made data pages RX; they're now flipped back to RW, and all 417 ctors pass.
+- [x] **Crash identified & instrumented** — the game calls `abort()` at ~165s from libc++'s `__throw_system_error` path (confirmed by symbolized caller: `libgame.so` `error_category::equivalent+0xec`). Added: frame-pointer backtrace with per-frame symbolization on abort/exit, unrecovered-fault PC/LR capture in the exception handler, recovery window widened over the whole game loop (incl. `eglSwapBuffers`).
+- [x] **Game output captured** — `debugStringOnAndroid` JNI payloads, writes to the game's stdout/stderr (including through the fake Bionic `__sF`), and `android_set_abort_message` all land in `compat_log.txt` now.
+- [x] **`getrandom` implemented** — `syscall(__NR_getrandom)`, `getentropy`, and `getrandom` are backed by the Switch CSRNG (`std::random_device` suspect for the abort).
+- [x] **Automatic screenshots** — launcher saves `ui_menu/ui_loading/ui_result/ui_about.png`; the game loop saves the GL framebuffer at frames 30/300/900. All in `sdmc:/AndroidHorizonNX/screenshots/`.
+- [x] **Epic UI overhaul** — icon-matched theme: gradient space sky, 110 twinkling/drifting stars, green planet horizon with glowing rim (cached to a texture), borealis-style eased focus card with pulsing glow, real HOS button glyphs (, , …) from the NintendoExt system font with chip fallback, translucent header/footer, 60 fps menu.
+- [x] **Version system** — NACP version (shown in hbmenu) and the in-app version both derive from the auto-incrementing build number; the stale `.nacp` is regenerated every build.
+
+### Loader bring-up
 
 - [x] **SplitMap crash fixed** — root cause: `svcCreateCodeMemory` was called before `memcpy`, making the backing buffer inaccessible at userspace. Fixed by deferring `svcCreateCodeMemory` + `svcControlCodeMemory` to after the memcpy. All three `.so` files should now load past the ELF copy stage.
 - [x] **RELA/JMPREL logging dramatically reduced** — removed per-entry log lines (one `fflush` per entry on FAT32 was taking ~38 seconds for libapplovin alone). Now only unresolved symbols, WARN lines, and the end-of-table summary are logged — `applyRela` goes from ~8000 lines to ~30 per library.

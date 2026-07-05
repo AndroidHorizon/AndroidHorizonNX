@@ -138,6 +138,25 @@ struct App {
     std::vector<Star> stars;
     float selAnimY = -1.0f;        // eased focus-card position (borealis-style)
 
+    // One-shot README screenshot flags (each screen captured once per run)
+    bool shotMenu = false, shotLoading = false, shotResult = false, shotAbout = false;
+
+    // Save the composed frame (call just before SDL_RenderPresent) as a PNG in
+    // sdmc:/AndroidHorizonNX/screenshots/ — showcase material for the README.
+    void saveScreenshot(const char* name) {
+        mkdir("sdmc:/AndroidHorizonNX/screenshots", 0777);
+        SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(
+            0, SW, SH, 32, SDL_PIXELFORMAT_ABGR8888);
+        if (!s) return;
+        if (SDL_RenderReadPixels(rdr, nullptr, s->format->format,
+                                 s->pixels, s->pitch) == 0) {
+            char path[128];
+            snprintf(path, sizeof(path), "sdmc:/AndroidHorizonNX/screenshots/%s", name);
+            if (IMG_SavePNG(s, path) == 0) logMsg(path);
+        }
+        SDL_FreeSurface(s);
+    }
+
     // ------------------------------------------------------------------
     TTF_Font* openFont(int ptsize) {
         plInitialize(PlServiceType_User);
@@ -568,6 +587,11 @@ struct App {
                        {BG(GLYPH_Y, "Y"), "Rescan"}, {BG(GLYPH_MINUS, "-"), "About"},
                        {BG(GLYPH_PLUS, "+"), "Quit"}},
                       docked ? "Docked — games need handheld (touch screen)" : "");
+
+        if (!shotMenu && !apks.empty() && now > 3000) {  // icons + glow settled
+            shotMenu = true;
+            saveScreenshot("ui_menu.png");
+        }
         SDL_RenderPresent(rdr);
     }
 
@@ -727,6 +751,10 @@ struct App {
 
         drawFooterBar({}, "Please wait — sdmc:/AndroidHorizonNX/compat_log.txt");
 
+        if (!shotLoading && g_ui_pct >= 40) {  // mid-load with a lively log box
+            shotLoading = true;
+            saveScreenshot("ui_loading.png");
+        }
         SDL_RenderPresent(rdr);
     }
 
@@ -861,6 +889,10 @@ struct App {
 
             drawFooterBar({{BG(GLYPH_B, "B"), "Back to menu"}});
 
+            if (!shotResult) {
+                shotResult = true;
+                saveScreenshot("ui_result.png");
+            }
             SDL_RenderPresent(rdr);
             SDL_Delay(16);
         }
@@ -924,6 +956,10 @@ struct App {
 
             drawFooterBar({{BG(GLYPH_B, "B"), "Back to menu"}});
 
+            if (!shotAbout && avatarTex) {  // wait for the avatar to arrive
+                shotAbout = true;
+                saveScreenshot("ui_about.png");
+            }
             SDL_RenderPresent(rdr);
             SDL_Delay(16);
         }

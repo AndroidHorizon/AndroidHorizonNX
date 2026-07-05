@@ -195,20 +195,68 @@ static void logTermCaller(const char* what, void* ret_addr) {
     compatLogFmt("%s from %s", what, where);
     compatLogFlush();
 }
+
+// Walk the AArch64 frame-pointer chain ([x29] = caller fp, [x29+8] = lr) and
+// symbolize every return address. NDK arm64 builds keep frame pointers, so
+// this names the whole game call path that led to abort/exit. Each line is
+// flushed as it's written — if the walk hits a bogus fp and faults, everything
+// up to that frame is already on disk (and we were dying anyway).
+static void logBacktrace(void* fp) {
+    struct Frame { Frame* fp; void* lr; };
+    Frame* f = (Frame*)fp;
+    for (int i = 0; i < 24 && f; i++) {
+        if (((uintptr_t)f & 0xF) != 0) { compatLogFmt("  bt[%d]: fp misaligned — stop", i); break; }
+        void* lr = f->lr;
+        if (!lr) break;
+        char where[256];
+        elfDescribePc((uint64_t)lr, where, sizeof(where));
+        compatLogFmt("  bt[%d]: %s", i, where);
+        compatLogFlush();
+        Frame* next = f->fp;
+        if (next <= f) break;   // frames must strictly ascend the stack
+        f = next;
+    }
+    compatLogFlush();
+}
 static void sh_exit(int code) {
     compatLogFmt("game called exit(%d)", code);
     logTermCaller("exit called", __builtin_return_address(0));
+    logBacktrace(__builtin_frame_address(0));
     exit(code);
 }
 static void sh_abort() {
     compatLog("game called abort()");
     logTermCaller("abort called", __builtin_return_address(0));
+    logBacktrace(__builtin_frame_address(0));
     abort();
 }
 static void sh_exit_raw(int code) {
     compatLogFmt("game called _exit(%d)", code);
     logTermCaller("_exit called", __builtin_return_address(0));
     exit(code);
+}
+
+// ─── /dev/urandom virtual fd ─────────────────────────────────────────────────
+// libc++'s std::random_device ctor opens /dev/urandom — through bionic's
+// fortified __open_2, so no logged shim showed the failure. The path doesn't
+// exist on Switch, the ctor got -1, and __throw_system_error → abort() killed
+// the game ~170s in (confirmed by backtrace, build 54 log). Serve the open on
+// a magic fd backed by the Switch CSRNG instead.
+static const int URANDOM_FD = 0x55AA;
+static int devUrandomOpen(const char* p) {
+    if (p && (strcmp(p, "/dev/urandom") == 0 || strcmp(p, "/dev/random") == 0)) {
+        compatLogFmt("open %s → CSRNG virtual fd", p);
+        return URANDOM_FD;
+    }
+    return -1;
+}
+static ssize_t sh_read(int fd, void* b, size_t n) {
+    if (fd == URANDOM_FD) { if (b && n) randomGet(b, n); return (ssize_t)n; }
+    return read(fd, b, n);
+}
+static int sh_close(int fd) {
+    if (fd == URANDOM_FD) return 0;
+    return close(fd);
 }
 
 // write() routed through the log for stdout/stderr — libc++abi terminate
@@ -234,6 +282,8 @@ static FILE* stub_fopen(const char* path, const char* mode) {
 }
 // open() wrapper — logs every call so we can trace early constructor I/O
 static int stub_open(const char* path, int flags, ...) {
+    int vfd = devUrandomOpen(path);
+    if (vfd >= 0) return vfd;
     int fd = open(path, flags);
     if (fd < 0) compatLogFmt("open FAIL: %s flags=0x%x", path ? path : "?", flags);
     else        compatLogFmt("open OK:   %s flags=0x%x fd=%d", path ? path : "?", flags, fd);
@@ -543,7 +593,30 @@ static char* stub_getcwd(char* buf, size_t sz) {
     if (!buf || sz < 2) return nullptr;
     buf[0] = '/'; buf[1] = '\0'; return buf;
 }
-static long stub_syscall(long, ...) { errno = ENOSYS; return -1; }
+// getrandom(2) works (libnx CSRNG) — libc++'s std::random_device may use it.
+// Other syscall numbers are logged so the compat log shows what the game wanted.
+static long stub_syscall(long n, ...) {
+    if (n == 278 /* __NR_getrandom, arm64 */) {
+        va_list va; va_start(va, n);
+        void*  buf = va_arg(va, void*);
+        size_t len = va_arg(va, size_t);
+        va_end(va);
+        if (buf && len) randomGet(buf, len);
+        return (long)len;
+    }
+    compatLogFmt("syscall(%ld) → ENOSYS", n);
+    errno = ENOSYS;
+    return -1;
+}
+// Bionic API-28 entropy entry points (in case the game links them directly)
+static int stub_getentropy(void* buf, size_t len) {
+    if (buf && len) randomGet(buf, len);
+    return 0;
+}
+static ssize_t stub_getrandom(void* buf, size_t len, unsigned) {
+    if (buf && len) randomGet(buf, len);
+    return (ssize_t)len;
+}
 static int  stub_dl_iterate_phdr(void*, void*) { return 0; }
 
 // ─── Android-specific ────────────────────────────────────────────────────────
@@ -583,8 +656,12 @@ static char*   chk_strcpy(char* d, const char* s, size_t)     { return strcpy(d,
 static char*   chk_strncpy(char* d, const char* s, size_t n, size_t, size_t) { return strncpy(d,s,n); }
 static int     chk_vsprintf(char* d, int, size_t, const char* f, va_list v)  { return vsprintf(d,f,v); }
 static int     chk_vsnprintf(char* d, size_t n, int, size_t, const char* f, va_list v) { return vsnprintf(d,n,f,v); }
-static ssize_t chk_read(int fd, void* b, size_t n, size_t)    { return read(fd,b,n); }
-static int     chk_open2(const char* p, int fl)                { return open(p, fl, 0666); }
+static ssize_t chk_read(int fd, void* b, size_t n, size_t)    { return sh_read(fd,b,n); }
+static int     chk_open2(const char* p, int fl) {
+    int vfd = devUrandomOpen(p);
+    if (vfd >= 0) return vfd;
+    return open(p, fl, 0666);
+}
 
 // ─── pthread_mutexattr extras ─────────────────────────────────────────────────
 static int pt_mattr_init(void* a)       { if (a) memset(a, 0, 4); return 0; }
@@ -736,6 +813,45 @@ static size_t stub_mbsnrtowcs(wchar_t* d, const char** src, size_t nmc, size_t l
 // Provide a zero-filled placeholder so GOT entries are non-null.
 static uint8_t g_fake_sF[3 * 256] = {};
 
+// Anything the game prints to its stdout/stderr (&__sF[1]/&__sF[2]) would hit
+// the zeroed fake FILE and vanish — libc++abi's terminate/verbose-abort
+// messages included. Detect fake-__sF FILE* and divert the text to the log.
+static bool isFakeStdio(FILE* f) {
+    uint8_t* p = (uint8_t*)f;
+    return p >= g_fake_sF && p < g_fake_sF + sizeof(g_fake_sF);
+}
+static int sh_vfprintf(FILE* f, const char* fmt, va_list va) {
+    if (isFakeStdio(f)) {
+        char buf[512];
+        vsnprintf(buf, sizeof(buf), fmt ? fmt : "", va);
+        compatLogFmt("game stdio: %s", buf);
+        return (int)strlen(buf);
+    }
+    return vfprintf(f, fmt, va);
+}
+static int sh_fprintf(FILE* f, const char* fmt, ...) {
+    va_list va; va_start(va, fmt);
+    int r = sh_vfprintf(f, fmt, va);
+    va_end(va);
+    return r;
+}
+static int sh_fputs(const char* s, FILE* f) {
+    if (isFakeStdio(f)) { compatLogFmt("game stdio: %s", s ? s : ""); return 0; }
+    return fputs(s, f);
+}
+static size_t sh_fwrite(const void* p, size_t sz, size_t n, FILE* f) {
+    if (isFakeStdio(f)) {
+        char buf[512];
+        size_t c = sz * n < sizeof(buf) - 1 ? sz * n : sizeof(buf) - 1;
+        memcpy(buf, p, c); buf[c] = '\0';
+        compatLogFmt("game stdio: %s", buf);
+        return n;
+    }
+    return fwrite(p, sz, n, f);
+}
+static int sh_fputc(int c, FILE* f)  { if (isFakeStdio(f)) return c; return fputc(c, f); }
+static int sh_fflush(FILE* f)        { if (isFakeStdio(f)) return 0; return fflush(f); }
+
 // ─── Stack protection (Bionic provides these; stub for newlib) ────────────────
 extern "C" { uintptr_t __stack_chk_guard = 0xDEAD0BEEF; }
 extern "C" void __stack_chk_fail(void) {
@@ -812,33 +928,33 @@ static const ShimEntry g_shims[] = {
     {"snprintf",    (void*)snprintf},
     {"sscanf",      (void*)sscanf},
     {"printf",      (void*)printf},
-    {"fprintf",     (void*)fprintf},
+    {"fprintf",     (void*)sh_fprintf},
     {"vprintf",     (void*)vprintf},
-    {"vfprintf",    (void*)vfprintf},
+    {"vfprintf",    (void*)sh_vfprintf},
     {"vsprintf",    (void*)vsprintf},
     {"vsnprintf",   (void*)vsnprintf},
     {"fopen",       (void*)stub_fopen},
     {"fclose",      (void*)fclose},
     {"fread",       (void*)fread},
-    {"fwrite",      (void*)fwrite},
+    {"fwrite",      (void*)sh_fwrite},
     {"fseek",       (void*)fseek},
     {"ftell",       (void*)ftell},
     {"fseeko",      (void*)stub_fseeko},
     {"ftello",      (void*)stub_ftello},
     {"rewind",      (void*)rewind},
-    {"fflush",      (void*)fflush},
+    {"fflush",      (void*)sh_fflush},
     {"feof",        (void*)feof},
     {"ferror",      (void*)ferror},
     {"fgets",       (void*)fgets},
-    {"fputs",       (void*)fputs},
+    {"fputs",       (void*)sh_fputs},
     {"fgetc",       (void*)fgetc},
-    {"fputc",       (void*)fputc},
+    {"fputc",       (void*)sh_fputc},
     {"getc",        (void*)getc},
     {"putc",        (void*)putc},
     {"ungetc",      (void*)ungetc},
     {"open",        (void*)stub_open},
-    {"close",       (void*)close},
-    {"read",        (void*)read},
+    {"close",       (void*)sh_close},
+    {"read",        (void*)sh_read},
     {"write",       (void*)sh_write},
     {"lseek",       (void*)lseek},
     {"stat",        (void*)stat},
@@ -1407,6 +1523,8 @@ static const ShimEntry g_shims[] = {
     {"sched_yield",     (void*)stub_sched_yield},
     {"sysconf",         (void*)stub_sysconf},
     {"syscall",         (void*)stub_syscall},
+    {"getentropy",      (void*)stub_getentropy},
+    {"getrandom",       (void*)stub_getrandom},
     {"dl_iterate_phdr", (void*)stub_dl_iterate_phdr},
     {"getpid",          (void*)stub_getpid},
     {"getuid",          (void*)stub_getuid},
