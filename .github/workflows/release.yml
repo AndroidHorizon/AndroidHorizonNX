@@ -1,9 +1,17 @@
 name: Build & Release
 
 # Manual only — never runs on push/PR. GitHub already restricts who can
-# dispatch a workflow manually to accounts with write access to the repo;
-# the membership check below is a second, explicit belt-and-suspenders
-# check that the person triggering it is actually in the AndroidHorizon org.
+# dispatch a workflow manually to accounts with WRITE access to the repo
+# (i.e. org members added as collaborators/teams with that role) — that's
+# the actual enforcement point, native to GitHub, not something this
+# workflow needs to reimplement.
+#
+# (An earlier version of this workflow added its own explicit org-membership
+# check on top of that. Removed it after the first real run: the workflow's
+# auto-generated GITHUB_TOKEN can't read org membership visibility — a
+# private membership reads identically to "not a member" through that API —
+# so the check failed even for a legitimate org owner. GitHub's native
+# write-access gating was already doing the actual job correctly.)
 on:
   workflow_dispatch:
     inputs:
@@ -21,24 +29,7 @@ permissions:
   contents: write
 
 jobs:
-  check-permission:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Verify triggering user is an AndroidHorizon org member
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/orgs/AndroidHorizon/members/${{ github.actor }}")
-          if [ "$STATUS" != "204" ]; then
-            echo "::error::${{ github.actor }} is not a public member of the AndroidHorizon org (or membership is private) — refusing to release."
-            exit 1
-          fi
-          echo "${{ github.actor }} confirmed as an AndroidHorizon org member."
-
   build-and-release:
-    needs: check-permission
     runs-on: ubuntu-latest
     steps:
       - name: Checkout launcher (AndroidHorizonNX)
