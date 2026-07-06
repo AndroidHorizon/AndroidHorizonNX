@@ -566,6 +566,16 @@ static AAsset* asset_open(AAssetManager* mgr, const char* fn, int) {
         compatLogFmt("AAsset_open: not found: %s", path);
         return nullptr;
     }
+    // This is cocos2d-x's REAL texture/asset loading path on Android
+    // (FileUtilsAndroid reads through AAssetManager, not plain fopen) — the
+    // same 64KB-buffer reasoning as stub_fopen applies here too, but this
+    // call site is a separate real fopen() our own compat code makes on the
+    // game's behalf, so it never picked up that fix. Thread-tagged logging
+    // confirmed textures decode synchronously on the main render thread
+    // during driving as new scenery streams in — this is almost certainly
+    // the actual file-read path behind that stutter, more so than the
+    // game's own direct fopen calls.
+    setvbuf(f, nullptr, _IOFBF, 64 * 1024);
     AAsset* a = (AAsset*)calloc(1, sizeof(AAsset));
     a->fp = f;
     fseek(f, 0, SEEK_END);

@@ -9,7 +9,7 @@
 #include <vector>
 #include <unordered_map>
 #include <string>
-#include <set>
+#include <unordered_set>
 
 extern void compatLog(const char* msg);
 extern void compatLogFmt(const char* fmt, ...);
@@ -29,20 +29,26 @@ static std::vector<JNINativeMethod> g_native_methods;
 
 // ─── Method registry ─────────────────────────────────────────────────────────
 // Each unique (name, sig) pair gets a stable MethodEntry pointer used as jmethodID.
+// g_method_pool holds the actual stable storage (jmethodID == &entry, must
+// never move/realloc); g_method_index is a name|sig -> pointer hash map purely
+// so repeated lookups don't do a linear scan of a pool that can grow past a
+// hundred entries in a real game — GetMethodID/GetStaticMethodID resolution
+// stays O(1) regardless of how many distinct methods the game has looked up
+// so far, instead of degrading as more accumulate.
 struct MethodEntry { char name[80]; char sig[128]; };
 static MethodEntry g_method_pool[512];
 static int g_method_count = 0;
+static std::unordered_map<std::string, MethodEntry*> g_method_index;
 
 static MethodEntry* lookupOrCreateMethod(const char* n, const char* sg) {
-    for (int i = 0; i < g_method_count; i++) {
-        if (strcmp(g_method_pool[i].name, n ? n : "") == 0 &&
-            strcmp(g_method_pool[i].sig,  sg ? sg : "") == 0)
-            return &g_method_pool[i];
-    }
+    std::string key = std::string(n ? n : "") + "|" + (sg ? sg : "");
+    auto it = g_method_index.find(key);
+    if (it != g_method_index.end()) return it->second;
     if (g_method_count < 512) {
         MethodEntry* e = &g_method_pool[g_method_count++];
         strncpy(e->name, n  ? n  : "", 79);  e->name[79]  = 0;
         strncpy(e->sig,  sg ? sg : "", 127); e->sig[127]  = 0;
+        g_method_index.emplace(std::move(key), e);
         return e;
     }
     return nullptr;
@@ -53,7 +59,6 @@ static MethodEntry* lookupOrCreateMethod(const char* n, const char* sg) {
 // worker threads too — serialize map access.
 static std::unordered_map<std::string, int>         g_int_store;
 static std::unordered_map<std::string, std::string> g_str_store;
-static std::set<std::string> g_logged_int_keys;   // suppress per-call spam
 static Mutex g_store_lock;
 struct StoreLock {
     StoreLock()  { mutexLock(&g_store_lock); }
@@ -65,7 +70,10 @@ struct StoreLock {
 // loading-screen bottleneck (~90 save-keys/second, build 64 log). Log each
 // unique message once; repeats are silent.
 static bool logOnce(const char* prefix, const char* a, const char* b = nullptr) {
-    static std::set<std::string> seen;
+    // unordered_set: this fires for every unique JNI lookup/key during
+    // loading (tens of thousands of calls total across a session) — O(1)
+    // average lookup instead of std::set's O(log n) tree walk.
+    static std::unordered_set<std::string> seen;
     std::string key = std::string(prefix) + "|" + (a ? a : "") + "|" + (b ? b : "");
     StoreLock sl;
     return seen.insert(key).second;
@@ -528,7 +536,10 @@ static void s_CallStaticVoidMethodV(JNIEnv*, jclass, jmethodID mid, va_list args
         compatAudioPlayMusic(p, loop != 0);
         return;
     }
-    if (strcmp(e->name, "preloadBackgroundMusic") == 0) { va_arg(args, jstring); return; }
+    if (strcmp(e->name, "preloadBackgroundMusic") == 0) {
+        compatAudioPreloadMusic((const char*)va_arg(args, jstring));
+        return;
+    }
     if (strcmp(e->name, "stopBackgroundMusic") == 0)    { compatAudioStopMusic(); return; }
     if (strcmp(e->name, "pauseBackgroundMusic") == 0)   { compatAudioPauseMusic(); return; }
     if (strcmp(e->name, "resumeBackgroundMusic") == 0)  { compatAudioResumeMusic(); return; }

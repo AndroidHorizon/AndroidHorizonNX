@@ -28,6 +28,7 @@ static Mix_Music*  g_music = nullptr;
 static float       g_music_vol = 1.0f;
 static float       g_fx_vol    = 1.0f;
 static std::unordered_map<std::string, Mix_Chunk*> g_chunks;
+static std::unordered_map<std::string, Mix_Music*> g_musicCache;
 
 static bool ensureInit() {
     if (g_inited) return true;
@@ -69,16 +70,36 @@ void compatAudioWarmup() {
     ensureInit();
 }
 
+// Cache decoded Mix_Music by resolved path — cocos2d-x switches tracks on
+// every scene change (loading -> gameplay, gameplay -> menu, ...), and
+// Mix_LoadMUS() re-opening + re-parsing the OGG header from the SD card was
+// happening synchronously right at that exact transition moment (same one
+// where the branding overlay hides and CPU boost mode resets) — a real
+// stutter suspect for "audio goes out of sync for a bit right as loading
+// ends". A repeat play of any track (returning to a stage, revisiting a
+// menu) now skips the reload entirely.
+static Mix_Music* getMusic(const std::string& full) {
+    auto it = g_musicCache.find(full);
+    if (it != g_musicCache.end()) return it->second;
+    Mix_Music* m = Mix_LoadMUS(full.c_str());
+    if (!m) compatLogFmt("audio: music load FAIL %s (%s)", full.c_str(), Mix_GetError());
+    g_musicCache[full] = m;  // cache the failure too (nullptr) — don't retry every call
+    return m;
+}
+
+void compatAudioPreloadMusic(const char* p) {
+    AudioLock al;
+    if (ensureInit()) getMusic(resolve(p));
+}
+
 void compatAudioPlayMusic(const char* path, bool loop) {
     AudioLock al;
     if (!ensureInit()) return;
     std::string full = resolve(path);
-    if (g_music) { Mix_HaltMusic(); Mix_FreeMusic(g_music); g_music = nullptr; }
-    g_music = Mix_LoadMUS(full.c_str());
-    if (!g_music) {
-        compatLogFmt("audio: music load FAIL %s (%s)", full.c_str(), Mix_GetError());
-        return;
-    }
+    Mix_HaltMusic();
+    Mix_Music* m = getMusic(full);
+    if (!m) return;
+    g_music = m;
     Mix_VolumeMusic((int)(g_music_vol * MIX_MAX_VOLUME));
     Mix_PlayMusic(g_music, loop ? -1 : 1);
     compatLogFmt("audio: music %s loop=%d", full.c_str(), loop ? 1 : 0);

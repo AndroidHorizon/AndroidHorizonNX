@@ -102,6 +102,16 @@ The road here, each step root-caused on real hardware: JIT data pages needed RW 
 
 ---
 
+## Forwarders — a dedicated home-menu icon per game
+
+Android Horizon can boot straight into one specific game, skipping the app-list picker entirely — the same idea as a RetroArch forwarder that jumps straight into a ROM+core instead of RetroArch's own content browser.
+
+**How it works:** pass the game's package name (e.g. `com.fingersoft.hillclimb`) as the first argument when launching `AndroidHorizonNX.nro`. This uses libnx's standard `envSetNextLoad(path, argv)` chain-load mechanism — the same one homebrew forwarders (RetroArch included) use to hand a target path + argument string to the next NRO. Any forwarder tool whose NSP/NRO creation flow lets you specify a launch argument (not just a target path) can point at `AndroidHorizonNX.nro` this way; whether Sphaira's own forwarder builder exposes an argument field specifically hasn't been checked against its current version — worth confirming there first since that's what's already in use for launching Android Horizon itself.
+
+If the requested package isn't installed (or the argument is stale/wrong), Android Horizon falls back to the normal app-list picker with an on-screen notice, rather than failing silently.
+
+---
+
 ## Setup
 
 1. Copy `AndroidHorizonNX.nro` to `sdmc:/switch/`
@@ -264,8 +274,8 @@ This is the real blocker on docked mode: right now only touch input is implement
 
 - [x] **Real accelerometer** — the actual Android NDK Sensor API (`ASensorManager`/`ASensorEventQueue`), backed by the Switch's real handheld six-axis sensor. Untested against a live game (Hill Climb Racing doesn't use it) — ready for a future tilt-control game.
 - [x] **Real battery percentage + charging status** — via libnx `psm`, exposed under the common Android SDK method-name patterns since there's no pure-NDK battery API to target precisely. Same caveat: untested against a live game.
-- [ ] Gyroscope (six-axis sensor already read for accelerometer — extracting angular velocity too is a small extension)
-- [ ] Real device info (model name, OS version strings) for games that branch on it
+- [x] **Real gyroscope** — same six-axis sensor reading already used for the accelerometer also carries angular velocity; now exposed as a second `ASensor` (`ASENSOR_TYPE_GYROSCOPE`) through the same real NDK API, converted from the Switch's revolutions/sec to Android's expected radians/sec. `ASensorEventQueue_getEvents` returns both events from one `hidGetSixAxisSensorStates` call per poll if a game enables both sensors. Same caveat as accelerometer: untested against a live game.
+- [ ] Real device info (model name, OS version strings) for games that branch on it — deliberately not started yet: our JNI layer returns the same dummy `jclass`/`jfieldID` for every `FindClass`/`GetStaticFieldID` call (fields aren't tracked by identity the way methods are), so faking `android.os.Build.MODEL` etc. needs a real refactor of static-field dispatch, not just a new case — bigger and riskier than it looks, holding off until a game actually needs it.
 
 ### Idea — Mii driver support
 
@@ -288,6 +298,37 @@ If this approach proves out across many games (not just Hill Climb Racing), the 
 ## Changelog
 
 > Most recent first.
+
+### 0.1.107 — Two safety practices adopted from prior art, plus the shop-crash finally fully explained
+
+- [x] **Preflight syscall check**: `launchApk()` now verifies `svcCreateCodeMemory`/`svcControlCodeMemory` are actually available (`envIsSyscallHinted`) before attempting any ELF/JIT work, with a clear error naming exactly what's missing — instead of a much more confusing failure partway through loading if the CFW/environment doesn't grant them.
+- [x] **Poison value for unresolved symbols**: any import we can't resolve now gets a distinctive out-of-range address (`0xBAD0BAD0BAD00000`) instead of a plain null — if a bug ever actually reaches one, the crash log is immediately recognizable as "hit an unimplemented import" rather than an ordinary null-pointer mystery.
+- [x] **Fully root-caused the deterministic Shop/IAP crash** (finally, via `.eh_frame` unwind-table lookup pinpointing the exact function boundaries — a technique this round's research surfaced). It's a generic `std::vector` append helper being handed an invalid *reference* by its caller — decoded the exact math: the caller computes something equivalent to `products[products.size() - 1]` on an **empty** product list, which underflows to address `0xFFFFFFFFFFFFFFF8` (-8), then passes that as a reference to copy from. Since our compat layer reports zero real IAP products (no real store), this path is always empty — explains why it's 100% deterministic. Not patched yet (see below) — this is a real, understood bug, with a concrete fix path, not fixed blind.
+
+### 0.1.106 — Performance audit: the real fix for the in-driving stutter
+
+Went back through the compat layer specifically looking for real, avoidable overhead rather than more speculative tuning — one genuine find, plus a couple of defensive improvements:
+
+- [x] **Found the actual file-read path behind the confirmed in-driving stutter.** Build 102's 64KB buffering fix only touched `stub_fopen` — the game's own *direct* `fopen()` calls. But cocos2d-x on Android reads assets (including the streamed scenery textures behind the earlier thread-tagged "main thread doing PNG decode" finding) through the NDK `AAssetManager` API, not raw `fopen`, which in our compat layer is a *separate* code path (`asset_open` in shim_table.cpp) that was still using newlib's tiny default buffer this whole time. This is very likely the actual mechanism behind the stutter, more so than the earlier fix — same 64KB `setvbuf` treatment now applied there too.
+- [x] **JNI method lookup is now O(1) instead of O(n).** `GetMethodID`/`GetStaticMethodID` resolution did a linear scan over every distinct method the game had looked up so far (potentially 100+ by mid-session) — added a hash-map index alongside the existing stable storage pool, so lookup time no longer grows with how long the game's been running.
+- [x] Same treatment for the log-dedup helper (`logOnce`): `std::set` (O(log n) tree) → `std::unordered_set` (O(1) average) — this fires for every unique JNI call/key across a session.
+- [x] Removed a dead, unused variable found during the audit (`g_logged_int_keys` — leftover from an earlier dedup approach, superseded by `logOnce`, never actually referenced).
+- Honest framing: this is a real, evidence-based pass, not a claim of "perfect" performance — the two confirmed, fixable overhead sources found this session are addressed; the game's own internal engine behavior (how cocos2d-x streams and decodes textures) is still not something we control directly.
+
+### 0.1.105 — Forwarder support + SVG background
+
+- [x] **Forwarder / direct-launch support**: Android Horizon now reads `argv[1]` as a package name to boot straight into, skipping the app-list picker entirely — the same mechanism RetroArch forwarders use (`envSetNextLoad(path, argv)`) to jump straight into a ROM+core instead of RetroArch's own content browser. A small forwarder NRO (Sphaira, hbmenu, or anything that can chain-load with an argument) pointed at `AndroidHorizonNX.nro` with a game's package name now gets its own dedicated "launch this one game" icon on the home menu. If the requested package isn't found/installed, it falls back to the normal picker with an on-screen notice instead of failing silently. A successful session already exits the whole process directly from inside the game loop (see the 0.1.102 fix below), so a forwarder-launched game closes straight back to the Switch home menu, never through our own UI.
+- [x] **Launcher background is now a real SVG**, rasterized once at startup instead of ~50 lines of hand-coded scanline gradient/circle math. Turns out devkitPro's SDL2_image portlib already bundles `nanosvg` internally for exactly this (found out the hard way — vendoring our own copy collided at link time with symbols already inside `libSDL2_image.a`), so this ended up being a plain `IMG_Load("romfs:/background.svg")` call, same as any other image this project loads. The animated twinkling starfield is unchanged (still drawn fresh every frame in C++, since that's genuine per-frame animation a static raster shouldn't own) — only the static sky/planet/horizon-glow layer moved to `romfs/background.svg`, easy to open and re-art-direct in any real vector editor going forward.
+
+### 0.1.102 — Fixed the + button flicker (same bug as the crash flicker, different trigger)
+
+- [x] **Found and fixed "+ makes everything flicker"**: the original crash-flicker fix (exiting cleanly via `exit(0)` instead of returning to the launcher in the same process) only applied when the game loop exited via a caught crash. Pressing + to quit deliberately exits the exact same loop through a different path (`crashed` stays false), which fell through to the OLD return-to-launcher cleanup — the same one proven to flicker, because any real background thread the game spawned (e.g. its own asset loader) doesn't care *why* the loop ended, only that it might still be running and racing the launcher's renderer. Now exits unconditionally on any game-loop exit, not just crashes.
+- [x] **Investigated "audio goes out of sync for a bit" right at the end of the loading screen**: found the game's music-track switch (loading music → gameplay music) calls into SDL_mixer's `Mix_LoadMUS` synchronously, at the *exact* same moment the branding overlay hides and CPU boost mode resets — a real contention point. Added a decoded-music cache (mirrors the existing sound-effect cache) so any track played more than once — returning to a menu, revisiting a stage — skips the reload entirely, and properly wired up `preloadBackgroundMusic` (previously a silent no-op) so a game that preloads ahead of time actually benefits. Doesn't eliminate the very first play of a brand-new track, so may not fully resolve this specific report — worth another log to see if it's better.
+
+### 0.1.101 — Real gyroscope
+
+- [x] Extended the existing real accelerometer implementation to also expose a real gyroscope through the same NDK Sensor API — no new hardware access needed, the six-axis sensor read already carried angular velocity, it just wasn't surfaced as a second sensor yet. Untested against a live game like its accelerometer sibling (Hill Climb Racing uses neither) — groundwork for a future motion-control game.
+- [x] Looked at implementing real `android.os.Build` device-info strings (model/OS version) too, but our JNI layer doesn't track static fields by identity (`GetStaticFieldID` returns the same dummy handle regardless of field name) — doing this properly needs a real dispatch refactor, not a quick addition. Held off rather than bolt on something that only half-works.
 
 ### 0.1.99 — Diagnostics for the in-driving freeze + volume reports
 
@@ -547,6 +588,21 @@ For those wondering about the setup, I'm running this on a modded V1 Switch — 
 The whole project is open-source and up on GitHub. If you know what you're doing, please send a pull request! I would love some help developing this further, adding controller support, and getting more games to run.
 
 Thanks for watching, go test it out, and have fun!
+
+---
+
+## Credits & Prior Art
+
+Android Horizon's core idea — load a game's real Android `.so` binary, patch/resolve what it needs, and run it natively instead of emulating anything — turns out to be a whole established homebrew niche, not something invented here from scratch. Researched this properly and want to credit it clearly:
+
+- **so_util** (by [TheOfficialFloW](https://github.com/TheOfficialFloW) / Andy Nguyen) — the original ELF-loading technique this whole scene is built on, first used to run Android games natively on PS Vita.
+- **[Rinnegatamante](https://github.com/Rinnegatamante)**, Bythos, frangarcj, CBPS, and the wider PS Vita homebrew scene — extended so_util across 45+ Android-to-Vita game ports (GTA: San Andreas, several Final Fantasy titles, Crazy Taxi, and many more).
+- **[max_nx](https://github.com/fgsfdsfgs/max_nx)** (fgsfdsfgs / Andy Nguyen) — the direct Nintendo Switch precedent: an AArch64 port of the same technique, running Max Payne Mobile's real Android binary natively on Switch. This is the closest existing project to what Android Horizon does, and reviewing its source (loader, symbol resolution, hooking approach) directly informed two concrete changes here:
+  - A preflight check that the JIT-related syscalls (`svcCreateCodeMemory`/`svcControlCodeMemory`) are actually available before attempting to load a game, with a clear error if not — max_nx does the same check for its own required syscalls.
+  - Writing a distinctive, out-of-range "poison" address into any unresolved import instead of leaving it null, so a bug that reaches an unimplemented function crashes with an unmistakable signature instead of an ordinary null-pointer mystery — adapted from max_nx's `taint_missing_imports` approach.
+- **[ffd_nx](https://github.com/NaGaa95/ffd_nx)** (NaGaa95) — a Final Fantasy Dimensions Switch port built directly on top of max_nx's loader, good confirmation this approach generalizes beyond a single game.
+
+Worth being clear about scope: max_nx's own source (loader internals, Max Payne-specific function hooks, OpenAL/OpenGL patches) is written for a different, much simpler native-Android game and doesn't transplant directly — Hill Climb Racing's cocos2d-x/JNI-Java-bridge architecture needs a real JNI/JavaVM emulation layer that Max Payne barely uses at all, and Android Horizon's ELF loader already has its own working (independently-arrived-at, and in some respects more complete) approach to threading, audio, and JNI dispatch. What's genuinely reusable — the two safety techniques above, plus the general validation that our independent design choices (fake stdio array, Bionic mutex sentinel handling, the TPIDR_EL0-is-zero-on-Switch workaround) match this established prior art — has been folded in with credit. The rest stays project-specific by necessity, not by not looking.
 
 ---
 

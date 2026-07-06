@@ -68,6 +68,16 @@ void* shimResolve(const char* name);
 static int g_unresolved_count = 0;
 int elfGetUnresolvedCount() { return g_unresolved_count; }
 
+// Poison value written into any relocation slot whose symbol we couldn't
+// resolve, instead of leaving it null. Same idea as max_nx's
+// taint_missing_imports (a similar Android-.so-on-Switch loader project):
+// a real bug that reaches an unresolved import would otherwise crash with a
+// far/pc of plain 0 or a small addend, indistinguishable from an ordinary
+// null-pointer bug elsewhere. This value's high bits put it far outside any
+// real Switch VA range (still faults if ever actually branched to/dereferenced
+// — same crash-and-recover behavior as before — just unmistakable in the log).
+static constexpr uint64_t kUnresolvedSymbolPoison = 0xBAD0BAD0BAD00000ULL;
+
 // First JIT failure code seen since elfResetCounts() (0 = all OK so far)
 static uint32_t g_last_svc_perm_code = 0;
 uint32_t elfGetLastSvcPermCode() { return g_last_svc_perm_code; }
@@ -435,6 +445,7 @@ static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count,
             if (!sym_addr) {
                 compatLogFmt("ELF: unresolved: %s", sym_name);
                 g_unresolved_count++;
+                sym_addr = kUnresolvedSymbolPoison;
             }
         }
 

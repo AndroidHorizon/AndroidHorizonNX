@@ -17,6 +17,8 @@
 #include "build_number.h"
 #include "avatar.h"
 
+extern void compatLogFmt(const char* fmt, ...);
+
 static const char* APK_DIR  = "sdmc:/AndroidHorizonNX/apks";
 static const char* LOG_FILE = "sdmc:/AndroidHorizonNX/log.txt";
 
@@ -146,6 +148,7 @@ struct App {
     // binary"). Block relaunch until the app is restarted.
     bool   gameRanOnce = false;
     Uint32 noticeUntil = 0;
+    std::string noticeText = "One game session per launch for now — restart Android Horizon to play again";
 
     // Save the composed frame (call just before SDL_RenderPresent) as a PNG in
     // sdmc:/AndroidHorizonNX/screenshots/ — showcase material for the README.
@@ -324,40 +327,21 @@ struct App {
             stars.push_back(s);
         }
 
-        bgTex = SDL_CreateTexture(rdr, SDL_PIXELFORMAT_RGBA8888,
-                                  SDL_TEXTUREACCESS_TARGET, SW, SH);
-        if (!bgTex) { logSDL("bg texture failed — flat background"); return; }
-        SDL_SetRenderTarget(rdr, bgTex);
-        SDL_SetRenderDrawBlendMode(rdr, SDL_BLENDMODE_BLEND);
-
-        // Sky: near-black zenith → icon indigo at the horizon
-        const SDL_Color SKY_TOP = {7, 6, 30, 255}, SKY_BOT = {26, 24, 97, 255};
-        for (int y = 0; y < SH; y++)
-            fill(0, y, SW, 1, lerpCol(SKY_TOP, SKY_BOT, (float)y / SH));
-
-        // Planet body: scanline spans of a huge circle, bright rim → deep green
-        const float cx = SW / 2.0f;
-        const float cy = SH - PLANET_BUMP + PLANET_R;
-        const SDL_Color RIM_C = {52, 230, 134, 255}, DEEP_C = {22, 140, 62, 255};
-        for (int y = SH - PLANET_BUMP; y < SH; y++) {
-            float dy = cy - y;
-            float hw = sqrtf(PLANET_R * PLANET_R - dy * dy);
-            float t  = (float)(y - (SH - PLANET_BUMP)) / PLANET_BUMP;
-            fill((int)(cx - hw), y, (int)(hw * 2), 1, lerpCol(RIM_C, DEEP_C, t));
-        }
-        // Rim glow: per-column arc above the edge, fading with distance
-        const int GLOW = 30;
-        for (int x = 0; x < SW; x += 2) {
-            float dx    = x - cx;
-            float yEdge = cy - sqrtf(PLANET_R * PLANET_R - dx * dx);
-            for (int t = 1; t <= GLOW; t++) {
-                float k = 1.0f - (float)t / GLOW;
-                fill(x, (int)yEdge - t, 2, 1, {52, 230, 134, (Uint8)(70 * k * k)});
-            }
-            fill(x, (int)yEdge, 2, 3, {150, 255, 195, 255});  // bright rim line
-        }
-
-        SDL_SetRenderTarget(rdr, nullptr);
+        // Sky/planet/horizon glow is authored as a real SVG (romfs:/background.svg
+        // — sky gradient, huge off-screen planet ellipse, radial glow)
+        // instead of hand-coded scanline math for the same look — easier to
+        // art-direct in an actual vector tool. SDL2_image's own portlib
+        // already bundles nanosvg internally (confirmed the hard way: vendoring
+        // our own copy collided at link time with symbols already inside
+        // libSDL2_image.a), so IMG_Load() rasterizes it directly, same as any
+        // other image format this project already loads. The animated
+        // starfield stays separate, drawn fresh every frame in
+        // drawBackground() on top of this static texture.
+        SDL_Surface* svgSurf = IMG_Load("romfs:/background.svg");
+        if (!svgSurf) { logSDL("background.svg load failed — flat background"); return; }
+        bgTex = SDL_CreateTextureFromSurface(rdr, svgSurf);
+        SDL_FreeSurface(svgSurf);
+        if (!bgTex) logSDL("bg texture failed — flat background");
     }
 
     void drawBackground() {
@@ -589,7 +573,7 @@ struct App {
         drawHeaderBar(cnt);
 
         if (noticeUntil && now < noticeUntil) {
-            const char* msg = "One game session per launch for now — restart Android Horizon to play again";
+            const char* msg = noticeText.c_str();
             int w = 0, h = 0;
             TTF_SizeUTF8(fSm, msg, &w, &h);
             fill((SW - w) / 2 - 16, SH - FOOTER_H - 44, w + 32, 34, {60, 18, 14, 235});
@@ -997,7 +981,14 @@ struct App {
 };
 
 // ---------------------------------------------------------------------------
-int main(int, char**) {
+// Forwarder support — a small NRO (or Sphaira/hbmenu entry) can chain-load us
+// with a package name as argv[1] via libnx's envSetNextLoad(path, argv), the
+// same mechanism RetroArch forwarders use to boot straight into a ROM+core
+// instead of RetroArch's own content browser. libnx's crt0 already parses the
+// loader-provided argument block into plain argc/argv before main() runs, so
+// no envGetArgv() plumbing is needed here — just read argv like any other
+// command-line program.
+int main(int argc, char** argv) {
     App app;
 
     if (!app.init()) return 1;
@@ -1013,6 +1004,42 @@ int main(int, char**) {
 
     app.apks = scanApks(APK_DIR);
     app.loadIcons();
+
+    // Direct-launch (forwarder) mode: argv[1] names a package to boot
+    // straight into, skipping the app-list UI entirely — same experience as
+    // a dedicated home-menu icon for one specific game.
+    if (argc > 1 && argv[1] && argv[1][0]) {
+        const char* wantPkg = argv[1];
+        int idx = -1;
+        for (size_t i = 0; i < app.apks.size(); i++) {
+            if (app.apks[i].packageName == wantPkg) { idx = (int)i; break; }
+        }
+        if (idx >= 0) {
+            const ApkInfo& apk = app.apks[idx];
+            bool skip = apk.installed;
+            LaunchResult res = app.runLaunch(apk, skip);
+            if (!skip) app.apks[idx].installed = true;
+            // A forwarder is meant to look like a dedicated launcher for
+            // this one game, not a detour through our full app list. Every
+            // successful game session now exits the whole process directly
+            // from inside the game loop itself (crash or deliberate quit
+            // alike) — runLaunch() only returns here at all when that DIDN'T
+            // happen (APK/ELF load failure, or nativeRender missing), so
+            // reaching this line always means something worth explaining
+            // before we close back to the Switch home menu.
+            app.showLaunchResult(res, idx);
+            return 0;
+        }
+        // Requested package not found/installed — fall back to the normal
+        // picker instead of silently doing nothing, so a stale/misconfigured
+        // forwarder still leaves you somewhere useful rather than a blank
+        // screen.
+        compatLogFmt("forwarder: requested package '%s' not found in %s — showing picker instead",
+                     wantPkg, APK_DIR);
+        app.noticeText  = std::string("Forwarder target \"") + wantPkg + "\" not found — showing all APKs";
+        app.noticeUntil = SDL_GetTicks() + 6000;
+    }
+
     app.render();
 
     bool   quit      = false;

@@ -473,6 +473,24 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
     compatLogFmt("launchApk: %s  pkg=%s  installed=%d",
                  apk_path.c_str(), pkg_name.c_str(), (int)already_installed);
 
+    // Preflight: the whole JIT dual-mapping scheme (elf_loader.cpp's SplitMap)
+    // rests on svcCreateCodeMemory (0x4B) and svcControlCodeMemory (0x4C)
+    // actually being available — both are privileged syscalls that depend on
+    // the CFW/environment we're launched under. Checking this up front (a
+    // technique borrowed from max_nx, a similar Android-.so-on-Switch loader)
+    // means a missing syscall fails here with a clear message instead of a
+    // much more confusing failure partway through ELF loading.
+    if (!envIsSyscallHinted(0x4B) || !envIsSyscallHinted(0x4C)) {
+        compatLogFmt("launchApk: required syscalls unavailable (CreateCodeMemory hinted=%d, ControlCodeMemory hinted=%d)",
+                     envIsSyscallHinted(0x4B), envIsSyscallHinted(0x4C));
+        result.errorStage  = "Checking environment";
+        result.errorDetail = "This CFW/environment doesn't allow JIT code memory "
+                              "(svcCreateCodeMemory/svcControlCodeMemory unavailable) — "
+                              "Android Horizon can't load game binaries here.";
+        if (g_compat_log) { logFlushDedup(); fclose(g_compat_log); g_compat_log = nullptr; }
+        return result;
+    }
+
     // ── 1. Set up directories (always, mkdirp is idempotent) ─────────────────
     std::string base_dir  = std::string("sdmc:/AndroidHorizonNX/games/") + pkg_name;
     std::string lib_dir   = base_dir + "/lib";
@@ -1507,15 +1525,22 @@ void runGameOnMainThread(void* game_so_ptr,
         // together, which a same-process "return to menu" fundamentally
         // cannot guarantee. The launcher UI already forced a full app
         // restart before allowing a second game session (see gameRanOnce
-        // in main.cpp), so a crash landing you at the same place is a
-        // smaller UX regression than an unrecoverable flicker.
-        if (crashed) {
-            compatLog("Cocos2d-x: crash recovery — exiting app cleanly rather than "
-                      "risking a still-running game thread racing the launcher");
-            compatLogFlush();
-            if (g_compat_log) { logFlushDedup(); fclose(g_compat_log); g_compat_log = nullptr; }
-            exit(0);
-        }
+        // in main.cpp), so landing back at the app list is a smaller UX
+        // regression than an unrecoverable flicker.
+        //
+        // This risk is NOT specific to a crash — a deliberate + button quit
+        // exits this same loop with `crashed` still false, but any real
+        // background libnx thread the game spawned (e.g. HCR's own asset
+        // loader) is just as likely to still be running either way. Reported
+        // "+ makes everything flicker" is the same freeze→fade→rapid-flicker
+        // symptom as the crash case, for the same reason — so exit
+        // unconditionally here instead of only on a caught crash.
+        compatLogFmt("Cocos2d-x: %s — exiting app cleanly rather than "
+                     "risking a still-running game thread racing the launcher",
+                     crashed ? "crash recovery" : "quit requested");
+        compatLogFlush();
+        if (g_compat_log) { logFlushDedup(); fclose(g_compat_log); g_compat_log = nullptr; }
+        exit(0);
     } else {
         compatLog("Cocos2d-x: nativeRender not found");
     }

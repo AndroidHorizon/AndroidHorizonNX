@@ -1,12 +1,14 @@
-// ─── Android NDK Sensor API (android/sensor.h) — real accelerometer ──────────
-// Unlike battery status (Java-only on real Android, no pure NDK path), the
-// accelerometer has a stable, well-documented native ABI that NDK games call
+// ─── Android NDK Sensor API (android/sensor.h) — real accelerometer + gyro ───
+// Unlike battery status (Java-only on real Android, no pure NDK path), motion
+// sensors have a stable, well-documented native ABI that NDK games call
 // directly with no JNI involved — so unlike battery, we can implement this
 // against the EXACT real API surface rather than guessing at method names.
-// Backed by the Switch's real six-axis sensor (handheld Joy-Con IMU) via
-// libnx hid. No current test game (Hill Climb Racing) uses this — it's
-// forward-looking groundwork for a future tilt-control game, requested
-// explicitly so "some games" that expect real Android sensor behaviour get it.
+// Both sensors are backed by the SAME Switch six-axis sensor reading (handheld
+// Joy-Con IMU) via libnx hid — one hidGetSixAxisSensorStates() call per frame
+// feeds both the accelerometer and gyroscope events. No current test game
+// (Hill Climb Racing) uses either — forward-looking groundwork for a future
+// tilt/motion-control game, requested explicitly so "some games" that expect
+// real Android sensor behaviour get it.
 //
 // Known limitation: Android's ASensorEventQueue is normally driven through
 // ALooper's fd-based event notification (the queue has a pollable fd; the
@@ -83,13 +85,15 @@ struct ASensorEvent {
 struct ASensorManager { int unused; };
 struct ASensor        { int32_t type; };
 struct ASensorEventQueue {
-    bool enabled = false;
+    bool accelEnabled = false;
+    bool gyroEnabled  = false;
     HidSixAxisSensorHandle handle;
     bool handleValid = false;
 };
 
 static ASensorManager g_manager;
 static ASensor        g_accelSensor  = { ASENSOR_TYPE_ACCELEROMETER };
+static ASensor        g_gyroSensor   = { ASENSOR_TYPE_GYROSCOPE };
 
 static bool ensureSixAxisStarted(ASensorEventQueue* q) {
     if (q->handleValid) return true;
@@ -120,17 +124,19 @@ ASensorManager* ASensorManager_getInstanceForPackage(const char*) {
 }
 
 int ASensorManager_getSensorList(ASensorManager*, ASensor const*** list) {
-    static ASensor const* one[1];
-    one[0] = &g_accelSensor;
-    if (list) *list = one;
-    compatLog("sensors: ASensorManager_getSensorList → [accelerometer]");
-    return 1;
+    static ASensor const* two[2];
+    two[0] = &g_accelSensor;
+    two[1] = &g_gyroSensor;
+    if (list) *list = two;
+    compatLog("sensors: ASensorManager_getSensorList → [accelerometer, gyroscope]");
+    return 2;
 }
 
 ASensor const* ASensorManager_getDefaultSensor(ASensorManager*, int type) {
     compatLogFmt("sensors: ASensorManager_getDefaultSensor(type=%d)", type);
     if (type == ASENSOR_TYPE_ACCELEROMETER) return &g_accelSensor;
-    return nullptr;  // gyroscope/magnetic/etc not wired up yet
+    if (type == ASENSOR_TYPE_GYROSCOPE)     return &g_gyroSensor;
+    return nullptr;  // magnetic/etc not wired up yet
 }
 
 ASensorEventQueue* ASensorManager_createEventQueue(ASensorManager*, void* /*ALooper*/,
@@ -148,14 +154,20 @@ int ASensorManager_destroyEventQueue(ASensorManager*, ASensorEventQueue* q) {
 int ASensorEventQueue_enableSensor(ASensorEventQueue* q, ASensor const* sensor) {
     if (!q || !sensor) return -1;
     if (!ensureSixAxisStarted(q)) return -1;
-    q->enabled = true;
-    compatLog("sensors: accelerometer enabled");
+    if (sensor->type == ASENSOR_TYPE_GYROSCOPE) {
+        q->gyroEnabled = true;
+        compatLog("sensors: gyroscope enabled");
+    } else {
+        q->accelEnabled = true;
+        compatLog("sensors: accelerometer enabled");
+    }
     return 0;
 }
 
-int ASensorEventQueue_disableSensor(ASensorEventQueue* q, ASensor const*) {
+int ASensorEventQueue_disableSensor(ASensorEventQueue* q, ASensor const* sensor) {
     if (!q) return -1;
-    q->enabled = false;
+    if (sensor && sensor->type == ASENSOR_TYPE_GYROSCOPE) q->gyroEnabled = false;
+    else                                                  q->accelEnabled = false;
     return 0;
 }
 
@@ -164,30 +176,54 @@ int ASensorEventQueue_setEventRate(ASensorEventQueue*, ASensor const*, int32_t) 
 }
 
 ssize_t ASensorEventQueue_getEvents(ASensorEventQueue* q, ASensorEvent* events, size_t count) {
-    if (!q || !q->enabled || !events || count == 0) return 0;
+    if (!q || (!q->accelEnabled && !q->gyroEnabled) || !events || count == 0) return 0;
     HidSixAxisSensorState state = {};
     size_t got = hidGetSixAxisSensorStates(q->handle, &state, 1);
     if (got == 0) return 0;
 
+    int64_t now = (int64_t)armGetSystemTick();
+    size_t n = 0;
+
     // Switch's HidVector acceleration is in units of G (1.0 = Earth gravity);
     // Android's ASensorVector for TYPE_ACCELEROMETER is in m/s^2 — multiply
     // by standard gravity to match what a real Android game expects.
-    const float G = 9.80665f;
-    ASensorEvent& ev = events[0];
-    memset(&ev, 0, sizeof(ev));
-    ev.version   = sizeof(ASensorEvent);
-    ev.sensor    = (int32_t)(intptr_t)&g_accelSensor;
-    ev.type      = ASENSOR_TYPE_ACCELEROMETER;
-    ev.timestamp = (int64_t)armGetSystemTick();
-    ev.acceleration.x = state.acceleration.x * G;
-    ev.acceleration.y = state.acceleration.y * G;
-    ev.acceleration.z = state.acceleration.z * G;
-    ev.acceleration.status = 3;  // SENSOR_STATUS_ACCURACY_HIGH
-    return 1;
+    if (q->accelEnabled && n < count) {
+        const float G = 9.80665f;
+        ASensorEvent& ev = events[n++];
+        memset(&ev, 0, sizeof(ev));
+        ev.version   = sizeof(ASensorEvent);
+        ev.sensor    = (int32_t)(intptr_t)&g_accelSensor;
+        ev.type      = ASENSOR_TYPE_ACCELEROMETER;
+        ev.timestamp = now;
+        ev.acceleration.x = state.acceleration.x * G;
+        ev.acceleration.y = state.acceleration.y * G;
+        ev.acceleration.z = state.acceleration.z * G;
+        ev.acceleration.status = 3;  // SENSOR_STATUS_ACCURACY_HIGH
+    }
+
+    // Switch's angular_velocity is in revolutions/sec; Android's TYPE_GYROSCOPE
+    // expects radians/sec — multiply by 2*pi to match.
+    if (q->gyroEnabled && n < count) {
+        const float TWO_PI = 6.283185307f;
+        ASensorEvent& ev = events[n++];
+        memset(&ev, 0, sizeof(ev));
+        ev.version   = sizeof(ASensorEvent);
+        ev.sensor    = (int32_t)(intptr_t)&g_gyroSensor;
+        ev.type      = ASENSOR_TYPE_GYROSCOPE;
+        ev.timestamp = now;
+        ev.vector.x = state.angular_velocity.x * TWO_PI;
+        ev.vector.y = state.angular_velocity.y * TWO_PI;
+        ev.vector.z = state.angular_velocity.z * TWO_PI;
+        ev.vector.status = 3;  // SENSOR_STATUS_ACCURACY_HIGH
+    }
+
+    return (ssize_t)n;
 }
 
 int ASensor_getType(ASensor const* s) { return s ? s->type : 0; }
-const char* ASensor_getName(ASensor const*) { return "Switch Accelerometer"; }
+const char* ASensor_getName(ASensor const* s) {
+    return (s && s->type == ASENSOR_TYPE_GYROSCOPE) ? "Switch Gyroscope" : "Switch Accelerometer";
+}
 const char* ASensor_getVendor(ASensor const*) { return "Nintendo"; }
 float ASensor_getResolution(ASensor const*) { return 0.0001f; }
 int ASensor_getMinDelay(ASensor const*) { return 10000; }  // 10ms ~= 100Hz, matches hid polling

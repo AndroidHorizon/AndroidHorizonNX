@@ -243,6 +243,7 @@ void jniUserDefaultsSave(bool force = false);
 void  compatAudioSetAssetsDir(const char* dir);
 void  compatAudioWarmup();
 void  compatAudioPlayMusic(const char* path, bool loop);
+void  compatAudioPreloadMusic(const char* path);
 void  compatAudioStopMusic();
 void  compatAudioPauseMusic();
 void  compatAudioResumeMusic();
