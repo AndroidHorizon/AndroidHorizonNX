@@ -276,10 +276,22 @@ If this approach proves out across many games (not just Hill Climb Racing), the 
 
 > Most recent first.
 
-### 0.1.81 — Decisive flicker fix: crash now exits cleanly instead of trying to recover
+### 0.1.87 — Shop crash guard + stability pass
+
+- [x] **The Shop no longer crashes the game.** Its crash is deterministic (same faulting instruction across multiple hardware runs) but deep in stripped game code we can't disassemble or fix directly. Instead of guessing at the Shop button's on-screen touch position to block it, the fix hooks a signal the game already gives us: `trackPage("...")` fires as it enters a new screen, and `jstring` values in this JNI layer are directly readable C strings — no extra decoding needed. If the page name contains "shop" (case-insensitive), Android Horizon floods the game with synthetic BACK-button presses for the next ~1.5 seconds and swallows touch input during that window, forcing its own navigation to bounce back out before the crash-prone code ever runs.
+- [x] **Stability fix found while building the above:** the BACK-press countdown was originally only decremented when the underlying native call succeeded — if that function pointer were ever null, the guard would swallow all touch input for the rest of the session instead of just its intended 1.5s window. Decoupled the countdown from the call so it always expires on schedule.
+- [x] **Confirmed on hardware: the crash-triggers-clean-exit fix from 0.1.81 works** — a crash now closes Android Horizon cleanly with no flicker.
+
+### 0.1.83 — Per-game asset patch mechanism (Switch controller guide images)
+
+- [x] **New: automatic per-game asset patching.** Hill Climb Racing bundles onboarding reference images for MOGA Bluetooth controllers (confirmed via `moga_pro_guide`/`moga_pocket_guide` save keys). Added a general mechanism (`applyGamePatches` in `loader.cpp`) that swaps specific extracted asset files for bundled Android Horizon replacements, matched by package name. Runs after every launch (fresh install or cached), so it stays current even if the replacement image changes across builds. The replacement is scaled to match the *original* file's exact dimensions (read from the file being replaced, not hardcoded) so it always drops in at the size the game's own UI expects.
+- [x] First patch target: replacing `Moga_Pro_Guide.png` with a Switch controller-equivalent button-layout image — laying groundwork for the Phase 4 controller-support idea above. **Now active** — the real replacement image is bundled into `romfs/patches/hillclimb/moga_pro_guide.png`. `Moga_Pocket_Guide.png` is still a no-op until that image is provided too.
+
+### 0.1.81 — Decisive flicker fix: crash now exits cleanly instead of trying to recover — **CONFIRMED FIXED ON HARDWARE**
 
 - [x] **Found the real mechanism behind the flicker, and stopped guessing at symptoms.** The log confirmed a real background thread (the game's own asset loader, spawned via our `pthread_create` → real libnx thread support) was still running at the time of a crash, 16 seconds after it started. We have no registry of threads a game spawns and no safe way to force-stop arbitrary running native code — so after a crash, there's no way to guarantee that thread (or others) isn't still executing, still touching shared JNI/audio/heap state, actively racing whatever the launcher tries to draw next. Two different one-time GL/EGL state fixes (swap-desync in 0.1.78, vsync in 0.1.79) didn't change the reported behaviour at all, which fits an *active, ongoing* conflict far better than a static leftover-state bug.
 - [x] **Fix: a caught crash no longer tries to return to the launcher's menu in the same process.** It logs the crash, then exits the whole app cleanly — Horizon OS tears down every thread in the process together, which a same-process "return to menu" fundamentally can't guarantee on its own. This trades "seamlessly keep browsing other games after a crash" for "guaranteed no flicker, ever" — given the app already required a full restart before a *second* game launch anyway, landing back at a restart after a crash is a smaller regression than an unrecoverable flicker loop.
+- [x] **Confirmed on real hardware**: the flicker is gone. A crash now closes Android Horizon cleanly instead.
 
 ### 0.1.80 — Overlay confirmed working + permanent hide latch
 

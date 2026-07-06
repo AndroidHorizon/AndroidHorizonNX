@@ -210,6 +210,16 @@ void         compatLogRaw(const char* msg);
 // overlay drawn over the game's loading screen (see loader.cpp).
 void         compatMarkSplashDone();
 
+// Called by jni_env.cpp when trackPage(...) fires with a page name that looks
+// like the Shop screen. The Shop has a deterministic crash (confirmed same
+// PC/offset across multiple hardware runs) we can't fix without the game's
+// source or a disassembler on the actual .so. Rather than guess at blocking
+// the Shop button's on-screen touch region (its exact position isn't known),
+// this floods the game with synthetic BACK key presses for the next couple
+// of seconds, giving its own menu-navigation code many chances to bounce out
+// of the Shop scene before whatever it does next has a chance to crash.
+void         compatBlockShopEntry();
+
 // UserDefault persistence (jni_env.cpp): loaded before nativeInit, saved on
 // every UserDefault.flush and at game exit.
 void jniUserDefaultsLoad(const char* path);

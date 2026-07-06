@@ -9,6 +9,7 @@
 #include <minizip/unzip.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <strings.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -269,6 +270,90 @@ static bool extractApk(const std::string& apk_path, const std::string& dest_dir,
     return true;
 }
 
+// ─── Per-game asset patches ───────────────────────────────────────────────────
+// Some games ship in-app reference images for specific hardware (Hill Climb
+// Racing bundles MOGA Bluetooth-controller button-layout guides — see
+// moga_pro_guide/moga_pocket_guide save keys). Swap them for Switch
+// controller-layout equivalents bundled in romfs, so if/when real controller
+// support lands, the game's own onboarding art already shows Switch buttons
+// instead of a MOGA pad nobody reading this owns. Applied after every
+// extraction (fresh or cached) so it's always current even if the patch
+// image itself changes across builds, and resized to match whatever
+// dimensions the ORIGINAL file actually has (read from the file we're about
+// to replace) rather than a hardcoded guess, since the exact original
+// dimensions aren't known ahead of time.
+struct AssetPatch { const char* filename; const char* romfsSrc; };
+static const AssetPatch kHillClimbPatches[] = {
+    {"Moga_Pro_Guide.png",    "romfs:/patches/hillclimb/moga_pro_guide.png"},
+    {"Moga_Pocket_Guide.png", "romfs:/patches/hillclimb/moga_pocket_guide.png"},
+};
+
+// Recursively search dir for a file matching `filename` (case-insensitive).
+// Returns the full path, or "" if not found. Extracted asset trees are only
+// a few directories deep, so a plain recursive walk is plenty fast.
+static std::string findFileRecursive(const std::string& dir, const std::string& filename) {
+    DIR* d = opendir(dir.c_str());
+    if (!d) return "";
+    std::string found;
+    struct dirent* ent;
+    while ((ent = readdir(d))) {
+        std::string nm = ent->d_name;
+        if (nm == "." || nm == "..") continue;
+        std::string path = dir + "/" + nm;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            found = findFileRecursive(path, filename);
+            if (!found.empty()) break;
+        } else if (strcasecmp(nm.c_str(), filename.c_str()) == 0) {
+            found = path;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void applyGamePatches(const std::string& pkg_name, const std::string& asset_dir) {
+    if (pkg_name != "com.fingersoft.hillclimb") return;
+    romfsInit();
+    for (const AssetPatch& patch : kHillClimbPatches) {
+        std::string target = findFileRecursive(asset_dir, patch.filename);
+        if (target.empty()) {
+            compatLogFmt("patch: %s not found under assets — skipped", patch.filename);
+            continue;
+        }
+        SDL_Surface* orig = IMG_Load(target.c_str());
+        if (!orig) {
+            compatLogFmt("patch: couldn't read original %s (%s) — skipped",
+                         target.c_str(), IMG_GetError());
+            continue;
+        }
+        int origW = orig->w, origH = orig->h;
+        SDL_FreeSurface(orig);
+
+        SDL_Surface* repl = IMG_Load(patch.romfsSrc);
+        if (!repl) {
+            compatLogFmt("patch: bundled replacement %s missing (%s) — skipped",
+                         patch.romfsSrc, IMG_GetError());
+            continue;
+        }
+        SDL_Surface* scaled = SDL_CreateRGBSurfaceWithFormat(
+            0, origW, origH, 32, SDL_PIXELFORMAT_ABGR8888);
+        if (scaled) {
+            SDL_SetSurfaceBlendMode(repl, SDL_BLENDMODE_NONE);  // scale RGBA as-is, no alpha compositing
+            SDL_BlitScaled(repl, nullptr, scaled, nullptr);
+            if (IMG_SavePNG(scaled, target.c_str()) == 0)
+                compatLogFmt("patch: replaced %s (%dx%d, Switch controller layout)",
+                             target.c_str(), origW, origH);
+            else
+                compatLogFmt("patch: failed to write %s (%s)", target.c_str(), IMG_GetError());
+            SDL_FreeSurface(scaled);
+        }
+        SDL_FreeSurface(repl);
+    }
+}
+
 // ─── Find all .so files ───────────────────────────────────────────────────────
 // Returns {size, path} pairs sorted smallest-first so dependency libs load
 // before the main game lib (which is typically the largest).
@@ -420,6 +505,9 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
         if (cb) cb("Loading cached install", "Skipping APK extraction...");
         compatLog("Already installed — skipping extraction");
     }
+
+    // Applied every launch (fresh or cached) so it's always current.
+    applyGamePatches(pkg_name, asset_dir);
 
     // ── 3. Find all .so files ────────────────────────────────────────────────
     compatUiLog("Scanning for .so files...");
@@ -612,6 +700,14 @@ LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
 // compatMarkSplashDone below) so it never overlaps actual gameplay.
 static volatile bool g_splash_active = true;
 void compatMarkSplashDone() { g_splash_active = false; }
+
+// See loader.h doc comment. Consumed once per frame in the game loop, which
+// sends a synthetic BACK key each frame while this is > 0.
+static volatile int g_force_back_frames = 0;
+void compatBlockShopEntry() {
+    g_force_back_frames = 90;  // ~1.5s at 60fps — several chances to register
+    compatLog("shop-guard: trackPage looked like Shop — forcing BACK for ~1.5s");
+}
 
 namespace {
 struct BrandOverlay {
@@ -1179,6 +1275,11 @@ void runGameOnMainThread(void* game_so_ptr,
                     // B button → Android BACK key (cocos routes it to menus)
                     if (ev.type == SDL_JOYBUTTONDOWN && ev.jbutton.button == 1 /*B*/ && keyDown)
                         keyDown(env, obj, 4 /*AKEYCODE_BACK*/);
+                    // Shop guard active (see compatBlockShopEntry) — swallow
+                    // touch input entirely so a lingering finger-down from
+                    // the tap that opened Shop can't trigger anything else
+                    // while we're forcing our way back out.
+                    if (g_force_back_frames > 0) continue;
                     if (ev.type == SDL_FINGERDOWN && touchBegin)
                         touchBegin(env, obj, (jint)ev.tfinger.fingerId,
                                    ev.tfinger.x * 1280.0f, ev.tfinger.y * 720.0f);
@@ -1191,6 +1292,19 @@ void runGameOnMainThread(void* game_so_ptr,
                         FloatArr1 ys  = {1, {ev.tfinger.y * 720.0f}};
                         touchMove(env, obj, &ids, &xs, &ys);
                     }
+                }
+
+                // Shop guard: inject one synthetic BACK per frame while
+                // active, giving the game's own navigation many chances to
+                // process it and leave the Shop scene before whatever runs
+                // next has a chance to hit its known crash. Decrement
+                // unconditionally — if keyDown were ever null, tying the
+                // countdown to a successful call would swallow touch input
+                // (see the `continue` above) forever instead of just for
+                // this one window.
+                if (g_force_back_frames > 0) {
+                    if (keyDown) keyDown(env, obj, 4 /*AKEYCODE_BACK*/);
+                    g_force_back_frames--;
                 }
 
                 nativeRender(env, obj);

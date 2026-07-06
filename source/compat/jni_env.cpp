@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -399,6 +400,25 @@ static void s_CallStaticVoidMethodV(JNIEnv*, jclass, jmethodID mid, va_list args
         const char* msg = (const char*)va_arg(args, jstring);
         if (logOnce("gdbg", msg ? msg : "null"))
             compatLogFmt("game debug: %s", msg ? msg : "null");
+        return;
+    }
+    // trackPage(pageName) fires as the game enters a new screen. The Shop
+    // screen has a confirmed, deterministic crash (same PC/offset across
+    // multiple hardware runs) we can't fix without the game's source or a
+    // disassembler on the actual .so — so instead of guessing at the Shop
+    // button's on-screen touch region (position isn't known), catch this
+    // and force our way back out before the crash-prone code runs. jstring
+    // is literally a `const char*` in this JNI layer (see s_NewStringUTF),
+    // so the page name is directly readable without GetStringUTFChars.
+    if (strcmp(e->name, "trackPage") == 0) {
+        const char* page = (const char*)va_arg(args, jstring);
+        compatLogFmt("JNI trackPage(%s)", page ? page : "null");
+        if (page) {
+            char lower[64]; size_t n = 0;
+            for (; page[n] && n < sizeof(lower) - 1; n++) lower[n] = (char)tolower((unsigned char)page[n]);
+            lower[n] = '\0';
+            if (strstr(lower, "shop")) compatBlockShopEntry();
+        }
         return;
     }
 
