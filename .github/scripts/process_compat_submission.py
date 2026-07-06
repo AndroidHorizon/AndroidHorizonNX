@@ -28,10 +28,7 @@ VERDICT_LABEL = {
 }
 
 LABEL_MAP = {
-    "Game name": "game_name",
-    "Package name": "package_name",
-    "Game version": "version_name",
-    "APK download URL": "apk_url",
+    "Upload the APK": "apk_url",
     "Where did this APK come from?": "source_site",
     "launcher_log.txt": "launcher_log",
     "compat_log.txt": "compat_log",
@@ -40,8 +37,7 @@ LABEL_MAP = {
 }
 
 REQUIRED_FIELDS = [
-    "game_name", "package_name", "version_name", "apk_url",
-    "source_site", "launcher_log", "compat_log", "core_log",
+    "apk_url", "source_site", "launcher_log", "compat_log", "core_log",
 ]
 
 STALL_RE = re.compile(r'(stall|STALL\(severe\)): frame (\d+) stalled for (\d+)ms')
@@ -90,6 +86,18 @@ def parse_issue_body(body: str) -> dict:
 
 def safe_path_component(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", s.strip())[:100] or "unknown"
+
+
+APK_URL_RE = re.compile(r'https?://[^\s()<>\[\]]+\.apk\b', re.IGNORECASE)
+
+
+def extract_apk_url(field_text: str):
+    """The "Upload the APK" field is either a plain pasted link, or GitHub's
+    auto-generated attachment markdown (`[game.apk](https://github.com/
+    user-attachments/files/.../game.apk)`) from dragging the file in — either
+    way, pull out the first URL that actually ends in .apk."""
+    m = APK_URL_RE.search(field_text)
+    return m.group(0) if m else None
 
 
 # --------------------------------------------------------------- GitHub API --
@@ -145,37 +153,112 @@ def download_apk(url, dest, max_bytes=300 * 1024 * 1024, timeout=180):
     return True, http_code, None
 
 
-def extract_icon(apk_path, out_path_no_ext):
-    import zipfile
+def read_apk_metadata(apk_path):
+    """Returns (package, version_name, app_name, error). Reads these straight
+    out of the compiled AndroidManifest.xml/resources via androguard, rather
+    than trusting hand-typed form fields that could drift from what was
+    actually tested."""
+    import logging
+    logging.getLogger("androguard").setLevel(logging.ERROR)
     try:
-        with zipfile.ZipFile(apk_path) as z:
-            candidates = []
-            for name in z.namelist():
-                lower = name.lower()
-                if not (lower.startswith("res/mipmap") or lower.startswith("res/drawable")):
-                    continue
-                base = lower.rsplit("/", 1)[-1]
-                if not (base.endswith(".png") or base.endswith(".webp")):
-                    continue
-                if "ic_launcher" not in base and "icon" not in base:
-                    continue
-                density_rank = 99
-                for i, d in enumerate(DENSITY_ORDER):
-                    if d in lower:
-                        density_rank = i
-                        break
-                candidates.append((density_rank, -z.getinfo(name).file_size, name))
-            if not candidates:
-                return None
-            candidates.sort()
-            best = candidates[0][2]
-            ext = ".png" if best.lower().endswith(".png") else ".webp"
-            out_path = out_path_no_ext + ext
-            with open(out_path, "wb") as f:
-                f.write(z.read(best))
-            return out_path
-    except zipfile.BadZipFile:
+        from androguard.core.apk import APK
+        a = APK(apk_path)
+        package = a.get_package()
+        version_name = a.get_androidversion_name()
+        app_name = a.get_app_name()
+    except Exception as e:
+        return None, None, None, f"couldn't read the APK's manifest ({e})"
+    if not package:
+        return None, None, None, "couldn't find a package name in the APK's manifest"
+    return package, (version_name or "unknown"), (app_name or package), None
+
+
+def _resolve_adaptive_icon_layer(apk_obj, axml_bytes):
+    """Adaptive icons (<adaptive-icon>, API 26+) point at separate
+    foreground/background layers instead of one bitmap. Those layers are
+    usually VectorDrawable XML too (not worth rasterizing path data for
+    this), but occasionally are plain PNG/WEBP — try the foreground layer,
+    then background, and use whichever first resolves to an actual bitmap."""
+    from androguard.core.axml import AXMLPrinter
+    try:
+        xml_text = AXMLPrinter(axml_bytes).get_xml().decode("utf-8", errors="ignore")
+    except Exception:
         return None
+    arsc = apk_obj.get_android_resources()
+    for tag in ("foreground", "background"):
+        m = re.search(rf'<{tag}[^>]*android:drawable="@([0-9A-Fa-f]+)"', xml_text)
+        if not m:
+            continue
+        try:
+            configs = arsc.get_resolved_res_configs(int(m.group(1), 16))
+        except Exception:
+            continue
+        if not configs:
+            continue
+        layer_path = configs[0][1]
+        if layer_path.lower().endswith((".png", ".webp")):
+            try:
+                return apk_obj.get_file(layer_path), (".png" if layer_path.lower().endswith(".png") else ".webp")
+            except Exception:
+                continue
+    return None
+
+
+def extract_icon(apk_path, out_path_no_ext):
+    icon_bytes, icon_ext = None, None
+
+    try:
+        import logging
+        logging.getLogger("androguard").setLevel(logging.ERROR)
+        from androguard.core.apk import APK
+        a = APK(apk_path)
+        icon_res = a.get_app_icon()
+        if icon_res and not icon_res.lower().endswith(".xml"):
+            data = a.get_file(icon_res)
+            if data:
+                icon_bytes = data
+                icon_ext = ".png" if icon_res.lower().endswith(".png") else ".webp"
+        elif icon_res:
+            resolved = _resolve_adaptive_icon_layer(a, a.get_file(icon_res))
+            if resolved:
+                icon_bytes, icon_ext = resolved
+    except Exception:
+        pass
+
+    if icon_bytes is None:
+        import zipfile
+        try:
+            with zipfile.ZipFile(apk_path) as z:
+                candidates = []
+                for name in z.namelist():
+                    lower = name.lower()
+                    if not (lower.startswith("res/mipmap") or lower.startswith("res/drawable")):
+                        continue
+                    base = lower.rsplit("/", 1)[-1]
+                    if not (base.endswith(".png") or base.endswith(".webp")):
+                        continue
+                    if "ic_launcher" not in base and "icon" not in base:
+                        continue
+                    density_rank = 99
+                    for i, d in enumerate(DENSITY_ORDER):
+                        if d in lower:
+                            density_rank = i
+                            break
+                    candidates.append((density_rank, -z.getinfo(name).file_size, name))
+                if candidates:
+                    candidates.sort()
+                    best = candidates[0][2]
+                    icon_bytes = z.read(best)
+                    icon_ext = ".png" if best.lower().endswith(".png") else ".webp"
+        except zipfile.BadZipFile:
+            pass
+
+    if icon_bytes is None:
+        return None
+    out_path = out_path_no_ext + icon_ext
+    with open(out_path, "wb") as f:
+        f.write(icon_bytes)
+    return out_path
 
 
 def check_play_store_category(package):
@@ -292,9 +375,12 @@ def main():
     if missing:
         reject(f"Missing required field(s): {', '.join(missing)}.")
 
-    parsed = urllib.parse.urlparse(data["apk_url"])
-    if parsed.scheme not in ("http", "https") or not parsed.path.lower().endswith(".apk"):
-        reject(f"The APK URL must be a direct http(s) link ending in `.apk` — got `{data['apk_url']}`.")
+    apk_url = extract_apk_url(data["apk_url"])
+    if not apk_url:
+        reject("Couldn't find a `.apk` link in the upload field — either the drag-and-drop upload "
+               "didn't attach properly, or the pasted link doesn't end in `.apk`. Split/`.xapk` "
+               "packages aren't supported yet.")
+    data["apk_url"] = apk_url
 
     workdir = tempfile.mkdtemp()
     apk_path = os.path.join(workdir, "game.apk")
@@ -308,6 +394,13 @@ def main():
     if magic != b"PK":
         reject("The downloaded file isn't a valid APK/ZIP (bad magic bytes) — "
                "check the link points directly at the .apk, not an HTML landing page.")
+
+    package, version_name, app_name, meta_err = read_apk_metadata(apk_path)
+    if meta_err:
+        reject(f"Couldn't read this APK ({meta_err}). Make sure it's a normal, unmodified .apk.")
+    data["package_name"] = package
+    data["version_name"] = version_name
+    data["game_name"] = app_name
 
     icon_path = extract_icon(apk_path, os.path.join(workdir, "icon"))
     play_status = check_play_store_category(data["package_name"])
