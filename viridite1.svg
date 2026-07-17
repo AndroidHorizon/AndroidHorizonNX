@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Punchy gradients inspired by Dolphin and Citra -->
+    <linearGradient id="gemBottomLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00C853"/>
+      <stop offset="100%" stop-color="#006633"/>
+    </linearGradient>
+    <linearGradient id="gemBottomRight" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00E676"/>
+      <stop offset="100%" stop-color="#00A854"/>
+    </linearGradient>
+    <linearGradient id="gemTopLeft" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00E676"/>
+      <stop offset="100%" stop-color="#69F0AE"/>
+    </linearGradient>
+    <linearGradient id="gemTopRight" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#69F0AE"/>
+      <stop offset="100%" stop-color="#B9F6CA"/>
+    </linearGradient>
+    <linearGradient id="gemCenter" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#B9F6CA"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Gem Silhouette with a subtle soft shadow (like Citra) -->
+  <polygon points="256,480 70,220 160,50 352,50 442,220" fill="rgba(0,0,0,0.15)" transform="translate(0, 15)"/>
+
+  <!-- Bottom Left Facet -->
+  <polygon points="256,480 70,220 256,260" fill="url(#gemBottomLeft)" />
+  
+  <!-- Bottom Right Facet -->
+  <polygon points="256,480 442,220 256,260" fill="url(#gemBottomRight)" />
+
+  <!-- Top Left Facet -->
+  <polygon points="70,220 160,50 256,260" fill="url(#gemTopLeft)" />
+
+  <!-- Top Right Facet -->
+  <polygon points="442,220 352,50 256,260" fill="url(#gemTopRight)" />
+
+  <!-- Center Top Facet (Diamond Table) -->
+  <polygon points="160,50 352,50 256,140" fill="url(#gemCenter)" />
+  
+  <!-- Sub-facets for extra 3D depth, cutting into a 'V' -->
+  <polygon points="160,50 256,140 256,260" fill="#69F0AE" opacity="0.6"/>
+  <polygon points="352,50 256,140 256,260" fill="#00E676" opacity="0.3"/>
+  
+  <!-- Outer Edge Highlights for polish -->
+  <polygon points="70,220 75,220 256,475 256,480" fill="#B9F6CA" opacity="0.5"/>
+  <polygon points="70,220 160,50 163,55 75,222" fill="#FFFFFF" opacity="0.7"/>
+</svg>
